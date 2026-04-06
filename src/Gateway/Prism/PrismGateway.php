@@ -242,6 +242,7 @@ class PrismGateway implements Gateway
         string $text,
         string $voice,
         ?string $instructions = null,
+        int $timeout = 30,
     ): AudioResponse {
         $voice = match ($voice) {
             'default-male' => 'ash',
@@ -255,6 +256,9 @@ class PrismGateway implements Gateway
                     ...$provider->additionalConfiguration(),
                     'api_key' => $provider->providerCredentials()['key'],
                 ]))
+                ->withClientOptions([
+                    'timeout' => $timeout,
+                ])
                 ->withInput($text)
                 ->withVoice($voice)
                 ->withProviderOptions(array_filter([
@@ -378,11 +382,9 @@ class PrismGateway implements Gateway
     protected static function toPrismProvider(Provider $provider): PrismProvider
     {
         return match ($provider->driver()) {
-            'anthropic' => PrismProvider::Anthropic,
             'azure' => PrismProvider::OpenAI,
             'deepseek' => PrismProvider::DeepSeek,
             'gemini' => PrismProvider::Gemini,
-            'groq' => PrismProvider::Groq,
             'mistral' => PrismProvider::Mistral,
             'ollama' => PrismProvider::Ollama,
             'openai' => PrismProvider::OpenAI,
