@@ -4,11 +4,11 @@ namespace Laravel\Ai\Gateway;
 
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Support\Collection;
-use Illuminate\Support\Facades\Http;
 use Laravel\Ai\Contracts\Gateway\EmbeddingGateway;
 use Laravel\Ai\Contracts\Gateway\RerankingGateway;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\RerankingProvider;
+use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\RankedDocument;
 use Laravel\Ai\Responses\EmbeddingsResponse;
@@ -16,10 +16,14 @@ use Laravel\Ai\Responses\RerankingResponse;
 
 class JinaGateway implements EmbeddingGateway, RerankingGateway
 {
+    use Concerns\CreatesClient;
+    use HandlesFailoverErrors;
+
     /**
      * Generate embedding vectors representing the given inputs.
      *
      * @param  string[]  $inputs
+     * @param  array<string, mixed>  $providerOptions
      */
     public function generateEmbeddings(
         EmbeddingProvider $provider,
@@ -27,13 +31,20 @@ class JinaGateway implements EmbeddingGateway, RerankingGateway
         array $inputs,
         int $dimensions,
         int $timeout = 30,
+        array $providerOptions = [],
     ): EmbeddingsResponse {
-        $response = $this->client($provider, $timeout)->post('/embeddings', [
-            'model' => $model,
-            'input' => array_map(fn (string $text) => ['text' => $text], $inputs),
-            'dimensions' => $dimensions,
-            'task' => 'retrieval.passage',
-        ]);
+        $response = $this->withErrorHandling(
+            $provider->name(),
+            fn () => $this->client($provider, $timeout)->post('/embeddings', array_merge(
+                ['task' => 'retrieval.passage'],
+                $providerOptions,
+                [
+                    'model' => $model,
+                    'input' => array_map(fn (string $text): array => ['text' => $text], $inputs),
+                    'dimensions' => $dimensions,
+                ],
+            )),
+        );
 
         $data = $response->json();
 
@@ -58,16 +69,19 @@ class JinaGateway implements EmbeddingGateway, RerankingGateway
         string $query,
         ?int $limit = null
     ): RerankingResponse {
-        $response = $this->client($provider)->post('/rerank', array_filter([
-            'model' => $model,
-            'query' => $query,
-            'documents' => $documents,
-            'top_n' => $limit,
-        ]));
+        $response = $this->withErrorHandling(
+            $provider->name(),
+            fn () => $this->client($provider)->post('/rerank', array_filter([
+                'model' => $model,
+                'query' => $query,
+                'documents' => $documents,
+                'top_n' => $limit,
+            ])),
+        );
 
         $data = $response->json();
 
-        $results = (new Collection($data['results']))->map(fn (array $result) => new RankedDocument(
+        $results = (new Collection($data['results']))->map(fn (array $result): RankedDocument => new RankedDocument(
             index: $result['index'],
             document: $documents[$result['index']],
             score: $result['relevance_score'],
@@ -84,12 +98,22 @@ class JinaGateway implements EmbeddingGateway, RerankingGateway
      */
     protected function client(EmbeddingProvider|RerankingProvider $provider, int $timeout = 30): PendingRequest
     {
-        return Http::baseUrl('https://api.jina.ai/v1')
-            ->withHeaders([
+        return $this->createClient(
+            $this->baseUrl($provider),
+            [
                 'Authorization' => 'Bearer '.$provider->providerCredentials()['key'],
                 'Content-Type' => 'application/json',
-            ])
-            ->timeout($timeout)
-            ->throw();
+            ],
+            $provider->additionalConfiguration()['headers'] ?? [],
+            $timeout,
+        );
+    }
+
+    /**
+     * Get the base URL for the Jina API.
+     */
+    protected function baseUrl(EmbeddingProvider|RerankingProvider $provider): string
+    {
+        return rtrim($provider->additionalConfiguration()['url'] ?? 'https://api.jina.ai/v1', '/');
     }
 }

@@ -23,7 +23,9 @@ trait HasRemoteContent
      */
     public function name(): ?string
     {
-        return $this->name ?? basename(parse_url($this->url, PHP_URL_PATH));
+        $path = parse_url($this->url, PHP_URL_PATH);
+
+        return $this->name ?? basename(is_string($path) ? $path : '');
     }
 
     /**
@@ -35,15 +37,11 @@ trait HasRemoteContent
     }
 
     /**
-     * Set the file's MIME type.
-     *
-     * @return $this
+     * Get the declared MIME type without fetching the remote resource.
      */
-    public function withMimeType(string $mimeType): static
+    public function declaredMimeType(): ?string
     {
-        $this->mime = $mimeType;
-
-        return $this;
+        return $this->mime;
     }
 
     /**

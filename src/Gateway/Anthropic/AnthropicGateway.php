@@ -2,31 +2,28 @@
 
 namespace Laravel\Ai\Gateway\Anthropic;
 
-use Closure;
 use Generator;
 use Illuminate\Contracts\Events\Dispatcher;
-use Illuminate\Http\Client\RequestException;
 use Laravel\Ai\Contracts\Files\TranscribableAudio;
 use Laravel\Ai\Contracts\Gateway\Gateway;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\ImageProvider;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
-use Laravel\Ai\Exceptions\InsufficientCreditsException;
-use Laravel\Ai\Exceptions\ProviderOverloadedException;
-use Laravel\Ai\Exceptions\RateLimitedException;
-use Laravel\Ai\Gateway\Concerns\InvokesTools;
+use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Gateway\Concerns\ParsesServerSentEvents;
+use Laravel\Ai\Gateway\StepContext;
+use Laravel\Ai\Gateway\StepResponse;
 use Laravel\Ai\Gateway\TextGenerationOptions;
 use Laravel\Ai\Responses\AudioResponse;
 use Laravel\Ai\Responses\EmbeddingsResponse;
 use Laravel\Ai\Responses\ImageResponse;
-use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Responses\TranscriptionResponse;
 use LogicException;
 
-class AnthropicGateway implements Gateway
+class AnthropicGateway implements Gateway, StepTextGateway
 {
     use Concerns\BuildsTextRequests;
     use Concerns\CreatesAnthropicClient;
@@ -35,40 +32,25 @@ class AnthropicGateway implements Gateway
     use Concerns\MapsMessages;
     use Concerns\MapsTools;
     use Concerns\ParsesTextResponses;
-    use InvokesTools;
+    use HandlesFailoverErrors;
     use ParsesServerSentEvents;
 
-    /**
-     * Patterns that indicate an insufficient credits or quota error.
-     *
-     * @var list<string>
-     */
-    protected static array $insufficientCreditPatterns = [
-        'credit balance',
-        'insufficient',
-        'quota exceeded',
-        'exceeded your current quota',
-        'billing',
-    ];
-
-    public function __construct(protected Dispatcher $events)
-    {
-        $this->initializeToolCallbacks();
-    }
+    public function __construct(protected Dispatcher $events) {}
 
     /**
      * {@inheritdoc}
      */
-    public function generateText(
+    public function generateTextStep(
         TextProvider $provider,
         string $model,
         ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
-    ): TextResponse {
+        array $messages,
+        array $tools,
+        ?array $schema,
+        ?TextGenerationOptions $options,
+        ?int $timeout,
+        StepContext $stepContext,
+    ): StepResponse {
         $body = $this->buildTextRequestBody(
             $provider,
             $model,
@@ -79,7 +61,7 @@ class AnthropicGateway implements Gateway
             $options,
         );
 
-        $response = $this->withRateLimitHandling(
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider, $timeout)->post('messages', $body),
         );
@@ -88,30 +70,23 @@ class AnthropicGateway implements Gateway
 
         $this->validateTextResponse($data);
 
-        return $this->parseTextResponse(
-            $data,
-            $provider,
-            filled($schema),
-            $tools,
-            $schema,
-            $options,
-            $body,
-        );
+        return $this->parseTextResponse($data, $provider, filled($schema))->withRawResponse($response);
     }
 
     /**
      * {@inheritdoc}
      */
-    public function streamText(
+    public function generateStreamStep(
         string $invocationId,
         TextProvider $provider,
         string $model,
         ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
+        array $messages,
+        array $tools,
+        ?array $schema,
+        ?TextGenerationOptions $options,
+        ?int $timeout,
+        StepContext $stepContext,
     ): Generator {
         $body = $this->buildTextRequestBody(
             $provider,
@@ -125,22 +100,18 @@ class AnthropicGateway implements Gateway
 
         $body['stream'] = true;
 
-        $response = $this->withRateLimitHandling(
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider, $timeout)
                 ->withOptions(['stream' => true])
                 ->post('messages', $body),
         );
 
-        yield from $this->processTextStream(
+        return yield from $this->processTextStream(
             $invocationId,
             $provider,
             $model,
-            $tools,
-            $schema,
-            $options,
             $response->getBody(),
-            $body,
         );
     }
 
@@ -189,8 +160,9 @@ class AnthropicGateway implements Gateway
         ?string $language = null,
         bool $diarize = false,
         int $timeout = 30,
+        array $providerOptions = [],
     ): TranscriptionResponse {
-        throw new LogicException('Anthropic does not support transcription.');
+        throw new LogicException('Anthropic does not support transcription generation.');
     }
 
     /**
@@ -204,50 +176,30 @@ class AnthropicGateway implements Gateway
         array $inputs,
         int $dimensions,
         int $timeout = 30,
+        array $providerOptions = [],
     ): EmbeddingsResponse {
-        throw new LogicException('Anthropic does not support embeddings.');
+        throw new LogicException('Anthropic does not support embedding generation.');
     }
 
     /**
-     * Execute a callback with Anthropic-specific exception handling.
-     *
-     * @template T
-     *
-     * @param  Closure(): T  $callback
-     * @return T
+     * {@inheritdoc}
      */
-    protected function withRateLimitHandling(string $providerName, Closure $callback): mixed
+    protected function overloadedStatusCodes(): array
     {
-        try {
-            return $callback();
-        } catch (RequestException $e) {
-            if ($e->response !== null) {
-                $status = $e->response->status();
+        return [529];
+    }
 
-                if ($status === 429) {
-                    throw RateLimitedException::forProvider(
-                        $providerName, $e->getCode(), $e
-                    );
-                }
-
-                if ($status === 529) {
-                    throw ProviderOverloadedException::forProvider(
-                        $providerName, $e->getCode(), $e
-                    );
-                }
-
-                $message = strtolower($e->response->json('error.message', ''));
-
-                foreach (static::$insufficientCreditPatterns as $pattern) {
-                    if (str_contains($message, $pattern)) {
-                        throw InsufficientCreditsException::forProvider(
-                            $providerName, $e->getCode(), $e
-                        );
-                    }
-                }
-            }
-
-            throw $e;
-        }
+    /**
+     * {@inheritdoc}
+     */
+    protected function insufficientCreditPatterns(): array
+    {
+        return [
+            'credit balance',
+            'insufficient',
+            'quota exceeded',
+            'exceeded your current quota',
+            'billing',
+        ];
     }
 }

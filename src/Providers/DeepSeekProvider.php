@@ -2,7 +2,10 @@
 
 namespace Laravel\Ai\Providers;
 
+use Illuminate\Contracts\Events\Dispatcher;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Providers\TextProvider;
+use Laravel\Ai\Gateway\DeepSeek\DeepSeekGateway;
 
 class DeepSeekProvider extends Provider implements TextProvider
 {
@@ -10,12 +13,25 @@ class DeepSeekProvider extends Provider implements TextProvider
     use Concerns\HasTextGateway;
     use Concerns\StreamsText;
 
+    public function __construct(protected array $config, protected Dispatcher $events)
+    {
+        //
+    }
+
+    /**
+     * Get the provider's text gateway.
+     */
+    public function textGateway(): StepTextGateway
+    {
+        return $this->textGateway ??= new DeepSeekGateway($this->events);
+    }
+
     /**
      * Get the name of the default text model.
      */
     public function defaultTextModel(): string
     {
-        return $this->config['models']['text']['default'] ?? 'deepseek-chat';
+        return $this->config['models']['text']['default'] ?? 'deepseek-v4-flash';
     }
 
     /**
@@ -23,7 +39,7 @@ class DeepSeekProvider extends Provider implements TextProvider
      */
     public function cheapestTextModel(): string
     {
-        return $this->config['models']['text']['cheapest'] ?? 'deepseek-chat';
+        return $this->config['models']['text']['cheapest'] ?? 'deepseek-v4-flash';
     }
 
     /**

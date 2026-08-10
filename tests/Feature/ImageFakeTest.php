@@ -1,8 +1,5 @@
 <?php
 
-namespace Tests\Feature;
-
-use Exception;
 use Illuminate\Support\Collection;
 use Laravel\Ai\Enums\Lab;
 use Laravel\Ai\Image;
@@ -12,159 +9,156 @@ use Laravel\Ai\Responses\Data\GeneratedImage;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\ImageResponse;
-use RuntimeException;
-use Tests\TestCase;
 
-class ImageFakeTest extends TestCase
-{
-    public function test_images_can_be_faked(): void
-    {
-        Image::fake([
-            base64_encode('first-image'),
-            fn (ImagePrompt $prompt) => base64_encode('second-image-'.$prompt->prompt),
-            new ImageResponse(
-                new Collection([new GeneratedImage(base64_encode('third-image'))]),
-                new Usage,
-                new Meta,
-            ),
-        ]);
+test('image rejects empty prompt', function (): void {
+    Image::fake();
 
-        $response = Image::of('First prompt')->generate();
-        $this->assertEquals(base64_encode('first-image'), $response->firstImage()->image);
+    Image::of('')->generate();
+})->throws(InvalidArgumentException::class, 'A prompt is required to generate an image.');
 
-        $response = Image::of('Second prompt')->generate();
-        $this->assertEquals(base64_encode('second-image-Second prompt'), $response->firstImage()->image);
+test('image rejects whitespace-only prompt', function (): void {
+    Image::fake();
 
-        $response = Image::of('Third prompt')->generate();
-        $this->assertEquals(base64_encode('third-image'), $response->firstImage()->image);
+    Image::of('   ')->generate();
+})->throws(InvalidArgumentException::class, 'A prompt is required to generate an image.');
 
-        // Assertion tests...
-        Image::assertGenerated(fn (ImagePrompt $prompt) => $prompt->prompt === 'First prompt');
-        Image::assertNotGenerated(fn (ImagePrompt $prompt) => $prompt->prompt === 'Missing prompt');
+test('images can be faked', function (): void {
+    Image::fake([
+        base64_encode('first-image'),
+        fn (ImagePrompt $prompt): string => base64_encode('second-image-'.$prompt->prompt),
+        new ImageResponse(
+            new Collection([new GeneratedImage(base64_encode('third-image'))]),
+            new Usage,
+            new Meta,
+        ),
+    ]);
 
-        Image::assertGenerated(function (ImagePrompt $prompt) {
-            return $prompt->prompt === 'First prompt';
-        });
-    }
+    $response = Image::of('First prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('first-image'));
 
-    public function test_can_assert_no_images_were_generated(): void
-    {
-        Image::fake();
+    $response = Image::of('Second prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('second-image-Second prompt'));
 
-        Image::assertNothingGenerated();
-    }
+    $response = Image::of('Third prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('third-image'));
 
-    public function test_images_can_be_faked_with_no_predefined_responses(): void
-    {
-        Image::fake();
+    // Assertion tests...
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'First prompt');
+    Image::assertNotGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'Missing prompt');
 
-        $response = Image::of('First prompt')->generate();
-        $this->assertEquals(base64_encode('fake-image-content'), $response->firstImage()->image);
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'First prompt');
+});
 
-        $response = Image::of('Second prompt')->generate();
-        $this->assertEquals(base64_encode('fake-image-content'), $response->firstImage()->image);
-    }
+test('can assert no images were generated', function (): void {
+    Image::fake();
 
-    public function test_images_can_be_faked_with_a_single_closure_that_is_invoked_for_every_generation(): void
-    {
-        Image::fake(function (ImagePrompt $prompt) {
-            return base64_encode('image-for-'.$prompt->prompt);
-        });
+    Image::assertNothingGenerated();
+});
 
-        $response = Image::of('First prompt')->generate();
-        $this->assertEquals(base64_encode('image-for-First prompt'), $response->firstImage()->image);
+test('images can be faked with no predefined responses', function (): void {
+    Image::fake();
 
-        $response = Image::of('Second prompt')->generate();
-        $this->assertEquals(base64_encode('image-for-Second prompt'), $response->firstImage()->image);
-    }
+    $response = Image::of('First prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('fake-image-content'));
 
-    public function test_images_can_prevent_stray_generations(): void
-    {
-        $this->expectException(RuntimeException::class);
+    $response = Image::of('Second prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('fake-image-content'));
+});
 
-        Image::fake()->preventStrayImages();
+test('images can be faked with a single closure that is invoked for every generation', function (): void {
+    Image::fake(fn (ImagePrompt $prompt): string => base64_encode('image-for-'.$prompt->prompt));
 
-        Image::of('First prompt')->generate();
-    }
+    $response = Image::of('First prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('image-for-First prompt'));
 
-    public function test_fake_closures_can_throw_exceptions(): void
-    {
-        $this->expectException(Exception::class);
+    $response = Image::of('Second prompt')->generate();
+    expect($response->firstImage()->image)->toEqual(base64_encode('image-for-Second prompt'));
+});
 
-        Image::fake(function () {
-            throw new Exception('Something went wrong');
-        });
+test('images can prevent stray generations', function (): void {
+    Image::fake()->preventStrayImages();
 
-        Image::of('Test prompt')->generate();
-    }
+    Image::of('First prompt')->generate();
+})->throws(RuntimeException::class);
 
-    public function test_image_size_and_quality_are_recorded(): void
-    {
-        Image::fake();
+test('fake closures can throw exceptions', function (): void {
+    Image::fake(function (): void {
+        throw new Exception('Something went wrong');
+    });
 
-        Image::of('A sunset')->square()->quality('high')->generate();
+    Image::of('Test prompt')->generate();
+})->throws(Exception::class);
 
-        Image::assertGenerated(function (ImagePrompt $prompt) {
-            return $prompt->prompt === 'A sunset'
-                && $prompt->size === '1:1'
-                && $prompt->quality === 'high';
-        });
-    }
+test('image size and quality are recorded', function (): void {
+    Image::fake();
 
-    public function test_queued_images_can_be_faked(): void
-    {
-        Image::fake();
+    Image::of('A sunset')->square()->quality('high')->generate();
 
-        Image::of('First prompt')->queue();
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'A sunset'
+        && $prompt->size === '1:1'
+        && $prompt->quality === 'high');
+});
 
-        Image::assertQueued(fn (QueuedImagePrompt $prompt) => $prompt->prompt === 'First prompt');
-        Image::assertNotQueued(fn (QueuedImagePrompt $prompt) => $prompt->contains('Second prompt'));
+test('image portrait aspect ratio is recorded', function (): void {
+    Image::fake();
 
-        Image::assertQueued(function (QueuedImagePrompt $prompt) {
-            return $prompt->prompt === 'First prompt';
-        });
+    Image::of('A sunset')->portrait()->generate();
 
-        Image::assertNotQueued(function (QueuedImagePrompt $prompt) {
-            return $prompt->prompt === 'Second prompt';
-        });
-    }
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'A sunset'
+        && $prompt->size === '2:3');
+});
 
-    public function test_can_assert_no_images_were_queued(): void
-    {
-        Image::fake();
+test('image custom size is recorded', function (): void {
+    Image::fake();
 
-        Image::assertNothingQueued();
-    }
+    Image::of('A sunset')->size('16:9')->generate();
 
-    public function test_generate_accepts_ai_provider_enum(): void
-    {
-        Image::fake();
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'A sunset'
+        && $prompt->size === '16:9');
+});
 
-        Image::of('Enum image')->generate(provider: Lab::Gemini);
+test('queued images can be faked', function (): void {
+    Image::fake();
 
-        Image::assertGenerated(fn (ImagePrompt $prompt) => $prompt->prompt === 'Enum image');
-    }
+    Image::of('First prompt')->queue();
 
-    public function test_queued_image_accepts_ai_provider_enum(): void
-    {
-        Image::fake();
+    Image::assertQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->prompt === 'First prompt');
+    Image::assertNotQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->contains('Second prompt'));
 
-        Image::of('Queued enum image')->queue(provider: Lab::OpenAI);
+    Image::assertQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->prompt === 'First prompt');
 
-        Image::assertQueued(fn (QueuedImagePrompt $prompt) => $prompt->prompt === 'Queued enum image'
-            && $prompt->provider === Lab::OpenAI);
-    }
+    Image::assertNotQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->prompt === 'Second prompt');
+});
 
-    public function test_queued_image_size_and_quality_are_recorded(): void
-    {
-        Image::fake();
+test('can assert no images were queued', function (): void {
+    Image::fake();
 
-        Image::of('A sunset')->landscape()->quality('low')->queue();
+    Image::assertNothingQueued();
+});
 
-        Image::assertQueued(function (QueuedImagePrompt $prompt) {
-            return $prompt->prompt === 'A sunset'
-                && $prompt->size === '3:2'
-                && $prompt->quality === 'low';
-        });
-    }
-}
+test('generate accepts ai provider enum', function (): void {
+    Image::fake();
+
+    Image::of('Enum image')->generate(provider: Lab::Gemini);
+
+    Image::assertGenerated(fn (ImagePrompt $prompt): bool => $prompt->prompt === 'Enum image');
+});
+
+test('queued image accepts ai provider enum', function (): void {
+    Image::fake();
+
+    Image::of('Queued enum image')->queue(provider: Lab::OpenAI);
+
+    Image::assertQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->prompt === 'Queued enum image'
+        && $prompt->provider === Lab::OpenAI);
+});
+
+test('queued image size and quality are recorded', function (): void {
+    Image::fake();
+
+    Image::of('A sunset')->landscape()->quality('low')->queue();
+
+    Image::assertQueued(fn (QueuedImagePrompt $prompt): bool => $prompt->prompt === 'A sunset'
+        && $prompt->size === '3:2'
+        && $prompt->quality === 'low');
+});

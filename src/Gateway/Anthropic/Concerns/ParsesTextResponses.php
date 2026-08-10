@@ -3,24 +3,20 @@
 namespace Laravel\Ai\Gateway\Anthropic\Concerns;
 
 use Illuminate\Support\Collection;
-use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Exceptions\AiException;
-use Laravel\Ai\Gateway\TextGenerationOptions;
-use Laravel\Ai\Messages\AssistantMessage;
-use Laravel\Ai\Messages\ToolResultMessage;
+use Laravel\Ai\Gateway\Concerns\DecodesStructuredOutput;
+use Laravel\Ai\Gateway\StepResponse;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\Data\FinishReason;
 use Laravel\Ai\Responses\Data\Meta;
-use Laravel\Ai\Responses\Data\Step;
 use Laravel\Ai\Responses\Data\ToolCall;
-use Laravel\Ai\Responses\Data\ToolResult;
 use Laravel\Ai\Responses\Data\UrlCitation;
 use Laravel\Ai\Responses\Data\Usage;
-use Laravel\Ai\Responses\StructuredTextResponse;
-use Laravel\Ai\Responses\TextResponse;
 
 trait ParsesTextResponses
 {
+    use DecodesStructuredOutput;
+
     /**
      * Validate the Anthropic response data.
      *
@@ -38,217 +34,65 @@ trait ParsesTextResponses
     }
 
     /**
-     * Parse the Anthropic response data into a TextResponse.
+     * Parse the Anthropic response data into a single step response.
      */
     protected function parseTextResponse(
         array $data,
         Provider $provider,
         bool $structured,
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        array $requestBody = [],
-    ): TextResponse {
-        return $this->processResponse(
-            $data,
+    ): StepResponse {
+        return $this->buildStepResponse(
+            $data['content'] ?? [],
             $provider,
+            $data['model'] ?? '',
+            $this->extractUsage($data),
+            $this->extractFinishReason($data),
             $structured,
-            $tools,
-            $schema,
-            new Collection,
-            new Collection,
-            $requestBody,
-            maxSteps: $options?->maxSteps,
         );
     }
 
     /**
-     * Process a single response, handling tool loops recursively.
+     * Build a single step response from Anthropic content blocks.
      */
-    protected function processResponse(
-        array $data,
+    protected function buildStepResponse(
+        array $content,
         Provider $provider,
+        string $model,
+        Usage $usage,
+        FinishReason $finishReason,
         bool $structured,
-        array $tools,
-        ?array $schema,
-        Collection $steps,
-        Collection $messages,
-        array $requestBody,
-        int $depth = 0,
-        ?int $maxSteps = null,
-    ): TextResponse {
-        $model = $data['model'] ?? '';
-        $content = $data['content'] ?? [];
-
+    ): StepResponse {
         $text = $this->extractText($content);
         $toolCalls = $this->extractToolCalls($content);
         $citations = $this->extractCitations($content);
-        $usage = $this->extractUsage($data);
-        $finishReason = $this->extractFinishReason($data);
-        $meta = new Meta($provider->name(), $model, $citations);
 
-        $realToolCalls = array_filter($toolCalls, fn (ToolCall $tc) => $tc->name !== 'output_structured_data');
+        $realToolCalls = array_values(array_filter($toolCalls, fn (ToolCall $tc): bool => $tc->name !== 'output_structured_data'));
         $hasStructuredToolCall = count($realToolCalls) < count($toolCalls);
-        $toolResults = [];
 
-        $shouldContinue = $finishReason === FinishReason::ToolCalls
-            && filled($realToolCalls)
-            && $depth + 1 < ($maxSteps ?? round(count($tools) * 1.5));
-
-        if ($shouldContinue) {
-            $toolResults = $this->executeToolCalls($realToolCalls, $tools);
-        }
-
-        $steps->push(new Step($text, $toolCalls, $toolResults, $finishReason, $usage, $meta));
-
-        $messages->push(new AssistantMessage($text, collect($toolCalls)));
-
-        if ($shouldContinue) {
-            $messages->push(new ToolResultMessage(collect($toolResults)));
-
-            return $this->continueWithToolResults(
-                $data,
-                $provider,
-                $structured,
-                $tools,
-                $schema,
-                $steps,
-                $messages,
-                $requestBody,
-                $toolResults,
-                $depth + 1,
-                $maxSteps,
-            );
-        }
+        $structuredData = null;
 
         if ($structured || $hasStructuredToolCall) {
             $structuredData = $this->extractStructuredOutput($content);
 
             if (empty($structuredData) && filled($text)) {
-                $structuredData = json_decode($text, true) ?? [];
+                $structuredData = $this->decodeStructuredOutput($text);
             }
-
-            return (new StructuredTextResponse(
-                $structuredData,
-                json_encode($structuredData) ?: '',
-                $this->combineUsage($steps),
-                $meta,
-            ))->withToolCallsAndResults(
-                toolCalls: $steps->flatMap(fn (Step $s) => $s->toolCalls),
-                toolResults: $steps->flatMap(fn (Step $s) => $s->toolResults),
-            )->withSteps($steps);
         }
 
-        return (new TextResponse(
-            $text,
-            $this->combineUsage($steps),
-            $meta,
-        ))->withMessages($messages)->withSteps($steps);
-    }
-
-    /**
-     * Execute tool calls and return tool results.
-     *
-     * @param  array<ToolCall>  $toolCalls
-     * @param  array<Tool>  $tools
-     * @return array<ToolResult>
-     */
-    protected function executeToolCalls(array $toolCalls, array $tools): array
-    {
-        $results = [];
-
-        foreach ($toolCalls as $toolCall) {
-            $tool = $this->findTool($toolCall->name, $tools);
-
-            if ($tool === null) {
-                continue;
-            }
-
-            $result = $this->executeTool($tool, $toolCall->arguments);
-
-            $results[] = new ToolResult(
-                $toolCall->id,
-                $toolCall->name,
-                $toolCall->arguments,
-                $result,
-                $toolCall->resultId,
-            );
+        // If the only tool call was the synthetic structured output, this is really a stop.
+        if ($finishReason === FinishReason::ToolCalls && $realToolCalls === []) {
+            $finishReason = FinishReason::Stop;
         }
 
-        return $results;
-    }
-
-    /**
-     * Continue the conversation with tool results by making a follow-up request.
-     */
-    protected function continueWithToolResults(
-        array $previousData,
-        Provider $provider,
-        bool $structured,
-        array $tools,
-        ?array $schema,
-        Collection $steps,
-        Collection $messages,
-        array $requestBody,
-        array $toolResults,
-        int $depth,
-        ?int $maxSteps,
-    ): TextResponse {
-        $requestBody['messages'][] = [
-            'role' => 'assistant',
-            'content' => $this->ensureToolInputIsObject($previousData['content'] ?? []),
-        ];
-
-        $toolResultContent = [];
-
-        foreach ($toolResults as $result) {
-            $toolResultContent[] = [
-                'type' => 'tool_result',
-                'tool_use_id' => $result->id,
-                'content' => $this->serializeToolResultOutput($result->result),
-            ];
-        }
-
-        $requestBody['messages'][] = [
-            'role' => 'user',
-            'content' => $toolResultContent,
-        ];
-
-        unset($requestBody['stream']);
-
-        $response = $this->withRateLimitHandling(
-            $provider->name(),
-            fn () => $this->client($provider)->post('messages', $requestBody),
+        return new StepResponse(
+            text: $hasStructuredToolCall && ! empty($structuredData) ? (json_encode($structuredData) ?: '') : $text,
+            toolCalls: $realToolCalls,
+            finishReason: $finishReason,
+            usage: $usage,
+            meta: new Meta($provider->name(), $model, $citations),
+            structured: $structuredData,
+            providerContentBlocks: $content,
         );
-
-        $data = $response->json();
-
-        $this->validateTextResponse($data);
-
-        return $this->processResponse(
-            $data,
-            $provider,
-            $structured,
-            $tools,
-            $schema,
-            $steps,
-            $messages,
-            $requestBody,
-            $depth,
-            $maxSteps,
-        );
-    }
-
-    /**
-     * Serialize a tool result output value to a string.
-     */
-    protected function serializeToolResultOutput(mixed $output): string
-    {
-        return match (true) {
-            is_string($output) => $output,
-            is_array($output) => json_encode($output),
-            default => strval($output),
-        };
     }
 
     /**
@@ -256,7 +100,7 @@ trait ParsesTextResponses
      */
     protected function extractText(array $content): string
     {
-        $textBlocks = array_filter($content, fn (array $block) => ($block['type'] ?? '') === 'text');
+        $textBlocks = array_filter($content, fn (array $block): bool => ($block['type'] ?? '') === 'text');
 
         return implode('', array_column($textBlocks, 'text'));
     }
@@ -268,9 +112,9 @@ trait ParsesTextResponses
      */
     protected function extractToolCalls(array $content): array
     {
-        $toolUseBlocks = array_filter($content, fn (array $block) => ($block['type'] ?? '') === 'tool_use');
+        $toolUseBlocks = array_filter($content, fn (array $block): bool => ($block['type'] ?? '') === 'tool_use');
 
-        return array_values(array_map(fn (array $block) => new ToolCall(
+        return array_values(array_map(fn (array $block): ToolCall => new ToolCall(
             $block['id'] ?? '',
             $block['name'] ?? '',
             $block['input'] ?? [],
@@ -335,6 +179,7 @@ trait ParsesTextResponses
         return match ($data['stop_reason'] ?? '') {
             'end_turn', 'stop_sequence' => FinishReason::Stop,
             'tool_use' => FinishReason::ToolCalls,
+            'pause_turn' => FinishReason::Continue,
             'max_tokens' => FinishReason::Length,
             default => FinishReason::Unknown,
         };
@@ -352,30 +197,5 @@ trait ParsesTextResponses
         }
 
         return [];
-    }
-
-    /**
-     * Ensure tool_use content blocks have their input cast to object for JSON serialization.
-     */
-    protected function ensureToolInputIsObject(array $content): array
-    {
-        return array_map(function (array $block) {
-            if (($block['type'] ?? '') === 'tool_use') {
-                $block['input'] = (object) ($block['input'] ?? []);
-            }
-
-            return $block;
-        }, $content);
-    }
-
-    /**
-     * Combine usage across all steps.
-     */
-    protected function combineUsage(Collection $steps): Usage
-    {
-        return $steps->reduce(
-            fn (Usage $carry, Step $step) => $carry->add($step->usage),
-            new Usage(0, 0)
-        );
     }
 }

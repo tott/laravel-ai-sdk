@@ -5,7 +5,8 @@ namespace Laravel\Ai\Gateway\OpenAi;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Contracts\Gateway\FileGateway;
 use Laravel\Ai\Contracts\Providers\FileProvider;
-use Laravel\Ai\Gateway\Concerns\HandlesRateLimiting;
+use Laravel\Ai\Enums\Lab;
+use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Gateway\Concerns\PreparesStorableFiles;
 use Laravel\Ai\Responses\FileResponse;
 use Laravel\Ai\Responses\StoredFileResponse;
@@ -13,7 +14,7 @@ use Laravel\Ai\Responses\StoredFileResponse;
 class OpenAiFileGateway implements FileGateway
 {
     use Concerns\CreatesOpenAiClient;
-    use HandlesRateLimiting;
+    use HandlesFailoverErrors;
     use PreparesStorableFiles;
 
     /**
@@ -21,7 +22,7 @@ class OpenAiFileGateway implements FileGateway
      */
     public function getFile(FileProvider $provider, string $fileId): FileResponse
     {
-        $response = $this->withRateLimitHandling(
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)
                 ->get("files/{$fileId}")
@@ -41,13 +42,16 @@ class OpenAiFileGateway implements FileGateway
     ): StoredFileResponse {
         [$content, $mime, $name] = $this->prepareStorableFile($file);
 
-        $response = $this->withRateLimitHandling(
+        $providerOptions = $this->resolveProviderOptions($file, $this->providerOptionsKey());
+
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)
                 ->attach('file', $content, $name, ['Content-Type' => $mime])
-                ->post('files', [
-                    'purpose' => 'user_data',
-                ])
+                ->post('files', array_merge(
+                    ['purpose' => $this->defaultPurpose()],
+                    $providerOptions,
+                ))
         );
 
         return new StoredFileResponse($response->json('id'));
@@ -58,10 +62,26 @@ class OpenAiFileGateway implements FileGateway
      */
     public function deleteFile(FileProvider $provider, string $fileId): void
     {
-        $this->withRateLimitHandling(
+        $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)
                 ->delete("files/{$fileId}")
         );
+    }
+
+    /**
+     * Get the default purpose to use when a file does not specify one.
+     */
+    protected function defaultPurpose(): string
+    {
+        return 'user_data';
+    }
+
+    /**
+     * Get the provider key used to resolve file upload options.
+     */
+    protected function providerOptionsKey(): Lab
+    {
+        return Lab::OpenAI;
     }
 }

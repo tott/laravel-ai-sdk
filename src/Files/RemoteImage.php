@@ -3,6 +3,7 @@
 namespace Laravel\Ai\Files;
 
 use Illuminate\Contracts\Support\Arrayable;
+use InvalidArgumentException;
 use JsonSerializable;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files\Concerns\CanBeUploadedToProvider;
@@ -10,12 +11,15 @@ use Laravel\Ai\Files\Concerns\HasRemoteContent;
 
 class RemoteImage extends Image implements Arrayable, JsonSerializable, StorableFile
 {
-    use CanBeUploadedToProvider, HasRemoteContent;
-
-    public ?string $mime = null;
+    use CanBeUploadedToProvider;
+    use HasRemoteContent;
 
     public function __construct(public string $url, ?string $mimeType = null)
     {
+        if (blank($url)) {
+            throw new InvalidArgumentException('Remote image URL cannot be empty.');
+        }
+
         $this->mime = $mimeType;
     }
 
@@ -26,7 +30,7 @@ class RemoteImage extends Image implements Arrayable, JsonSerializable, Storable
     {
         return [
             'type' => 'remote-image',
-            'name' => $this->name,
+            'name' => $this->name(),
             'url' => $this->url,
             'mime' => $this->mime,
         ];

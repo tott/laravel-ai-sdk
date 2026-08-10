@@ -2,18 +2,20 @@
 
 namespace Laravel\Ai\Gateway\OpenAi\Concerns;
 
+use Illuminate\Support\Arr;
 use Laravel\Ai\Messages\AssistantMessage;
 use Laravel\Ai\Messages\Message;
 use Laravel\Ai\Messages\MessageRole;
 use Laravel\Ai\Messages\ToolResultMessage;
 use Laravel\Ai\Messages\UserMessage;
+use Laravel\Ai\Providers\Provider;
 
 trait MapsMessages
 {
     /**
      * Map the given Laravel messages to OpenAI Responses API input format.
      */
-    protected function mapMessagesToInput(array $messages, ?string $instructions = null): array
+    protected function mapMessagesToInput(array $messages, ?string $instructions, Provider $provider): array
     {
         $input = [];
 
@@ -28,7 +30,7 @@ trait MapsMessages
             $message = Message::tryFrom($message);
 
             match ($message->role) {
-                MessageRole::User => $this->mapUserMessage($message, $input),
+                MessageRole::User => $this->mapUserMessage($message, $input, $provider),
                 MessageRole::Assistant => $this->mapAssistantMessage($message, $input),
                 MessageRole::ToolResult => $this->mapToolResultMessage($message, $input),
             };
@@ -40,14 +42,14 @@ trait MapsMessages
     /**
      * Map a user message to OpenAI format.
      */
-    protected function mapUserMessage(UserMessage|Message $message, array &$input): void
+    protected function mapUserMessage(UserMessage|Message $message, array &$input, Provider $provider): void
     {
         $content = [
             ['type' => 'input_text', 'text' => $message->content],
         ];
 
         if ($message instanceof UserMessage && $message->attachments->isNotEmpty()) {
-            $content = array_merge($content, $this->mapAttachments($message->attachments));
+            $content = array_merge($content, $this->mapAttachments($message->attachments, $provider));
         }
 
         $input[] = [
@@ -61,6 +63,44 @@ trait MapsMessages
      */
     protected function mapAssistantMessage(AssistantMessage|Message $message, array &$input): void
     {
+        if ($message instanceof AssistantMessage && $message->toolCalls->isNotEmpty()) {
+            $reasoningBlocks = $message->toolCalls
+                ->whereNotNull('reasoningId')
+                ->unique('reasoningId')
+                ->map(fn ($toolCall) => Arr::whereNotNull([
+                    'type' => 'reasoning',
+                    'id' => $toolCall->reasoningId,
+                    'summary' => $toolCall->reasoningSummary ?? [],
+                    'encrypted_content' => $toolCall->reasoningEncryptedContent,
+                ]))
+                ->values()
+                ->all();
+
+            foreach ($reasoningBlocks as $reasoningBlock) {
+                $input[] = $reasoningBlock;
+
+                foreach ($message->toolCalls->where('reasoningId', $reasoningBlock['id']) as $toolCall) {
+                    $input[] = [
+                        'id' => $toolCall->id,
+                        'call_id' => $toolCall->resultId,
+                        'type' => 'function_call',
+                        'name' => $toolCall->name,
+                        'arguments' => json_encode($toolCall->arguments ?: (object) []),
+                    ];
+                }
+            }
+
+            foreach ($message->toolCalls->whereNull('reasoningId') as $toolCall) {
+                $input[] = [
+                    'id' => $toolCall->id,
+                    'call_id' => $toolCall->resultId,
+                    'type' => 'function_call',
+                    'name' => $toolCall->name,
+                    'arguments' => json_encode($toolCall->arguments ?: (object) []),
+                ];
+            }
+        }
+
         if (filled($message->content)) {
             $input[] = [
                 'role' => 'assistant',
@@ -71,31 +111,6 @@ trait MapsMessages
                     ],
                 ],
             ];
-        }
-
-        if ($message instanceof AssistantMessage && $message->toolCalls->isNotEmpty()) {
-            $reasoningBlocks = $message->toolCalls
-                ->whereNotNull('reasoningId')
-                ->unique('reasoningId')
-                ->map(fn ($toolCall) => [
-                    'type' => 'reasoning',
-                    'id' => $toolCall->reasoningId,
-                    'summary' => $toolCall->reasoningSummary,
-                ])
-                ->values()
-                ->all();
-
-            array_push($input, ...$reasoningBlocks);
-
-            foreach ($message->toolCalls as $toolCall) {
-                $input[] = [
-                    'id' => $toolCall->id,
-                    'call_id' => $toolCall->resultId,
-                    'type' => 'function_call',
-                    'name' => $toolCall->name,
-                    'arguments' => json_encode($toolCall->arguments),
-                ];
-            }
         }
     }
 

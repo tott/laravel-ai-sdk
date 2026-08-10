@@ -1,47 +1,147 @@
 <?php
 
-namespace Tests\Feature;
-
+use Illuminate\Support\Facades\Http;
 use Laravel\Ai\Embeddings;
 use Laravel\Ai\Enums\Lab;
+use Laravel\Ai\Files\Audio;
+use Laravel\Ai\Files\Document;
+use Laravel\Ai\Files\Image;
+use Laravel\Ai\Files\Video;
 use Laravel\Ai\Prompts\EmbeddingsPrompt;
 use Laravel\Ai\Prompts\QueuedEmbeddingsPrompt;
-use RuntimeException;
-use Tests\TestCase;
 
-class EmbeddingsFakeTest extends TestCase
-{
-    public function test_can_fake_embeddings(): void
-    {
+test('embeddings reject empty input list', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for([])->generate();
+})->throws(InvalidArgumentException::class, 'At least one input is required to generate embeddings.');
+
+test('embeddings reject associative input array', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for(['first' => 'Hello world'])->generate();
+})->throws(InvalidArgumentException::class, 'Inputs to embed must be a list, not an associative array.');
+
+test('embeddings reject blank string inputs', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for([''])->generate();
+})->throws(InvalidArgumentException::class, 'The input at index 0 must be a non-blank string.');
+
+test('embeddings reject whitespace-only string inputs', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for([" \t\n"])->generate();
+})->throws(InvalidArgumentException::class, 'The input at index 0 must be a non-blank string.');
+
+test('embeddings reject non-string inputs', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for([123])->generate();
+})->throws(InvalidArgumentException::class, 'The input at index 0 must be a string or an image, audio, document, or video file.');
+
+test('embeddings report the offending index for blank inputs', function (): void {
+    Embeddings::fake();
+
+    Embeddings::for(['valid', 'also valid', ''])->generate();
+})->throws(InvalidArgumentException::class, 'The input at index 2 must be a non-blank string.');
+
+describe('generating embeddings', function (): void {
+    test('can fake embeddings', function (): void {
         Embeddings::fake();
 
         $response = Embeddings::for(['Hello world'])->generate();
 
-        $this->assertCount(1, $response);
-        $this->assertCount(1536, $response->first());
-    }
+        expect($response)->toHaveCount(1)
+            ->and($response->first())->toHaveCount(1536);
+    });
 
-    public function test_can_fake_embeddings_with_custom_dimensions(): void
-    {
+    test('can fake embeddings with custom dimensions', function (): void {
         Embeddings::fake();
 
         $response = Embeddings::for(['Hello world'])->dimensions(512)->generate();
 
-        $this->assertCount(1, $response);
-        $this->assertCount(512, $response->first());
-    }
+        expect($response)->toHaveCount(1)
+            ->and($response->first())->toHaveCount(512);
+    });
 
-    public function test_can_fake_embeddings_with_multiple_inputs(): void
-    {
+    test('can fake embeddings with multiple inputs', function (): void {
         Embeddings::fake();
 
         $response = Embeddings::for(['Hello', 'World', 'Test'])->generate();
 
-        $this->assertCount(3, $response);
-    }
+        expect($response)->toHaveCount(3);
+    });
 
-    public function test_can_fake_embeddings_with_custom_response(): void
-    {
+    test('can iterate over response', function (): void {
+        Embeddings::fake([
+            [
+                array_fill(0, 3, 0.1),
+                array_fill(0, 3, 0.2),
+            ],
+        ]);
+
+        $response = Embeddings::for(['Hello', 'World'])->dimensions(3)->generate();
+
+        $embeddings = [];
+
+        foreach ($response as $embedding) {
+            $embeddings[] = $embedding;
+        }
+
+        expect($embeddings)->toEqual([
+            array_fill(0, 3, 0.1),
+            array_fill(0, 3, 0.2),
+        ]);
+    });
+
+    test('can fake embeddings with image input', function (): void {
+        Embeddings::fake();
+
+        $response = Embeddings::for([
+            Image::fromBase64(base64_encode('image-bytes'), 'image/png'),
+        ])->generate();
+
+        expect($response)->toHaveCount(1);
+    });
+
+    test('can fake embeddings with audio input', function (): void {
+        Embeddings::fake();
+
+        $response = Embeddings::for([
+            Audio::fromBase64(base64_encode('audio-bytes'), 'audio/mpeg'),
+        ])->generate();
+
+        expect($response)->toHaveCount(1);
+    });
+
+    test('can fake embeddings with document input', function (): void {
+        Embeddings::fake();
+
+        $response = Embeddings::for([
+            Document::fromBase64(base64_encode('%PDF-1.4 fake'), 'application/pdf'),
+        ])->generate();
+
+        expect($response)->toHaveCount(1);
+    });
+
+    test('can fake embeddings with video input', function (): void {
+        Embeddings::fake();
+
+        $response = Embeddings::for([
+            Video::fromBase64(base64_encode('video-bytes'), 'video/mp4'),
+        ])->generate();
+
+        expect($response)->toHaveCount(1);
+    });
+
+    test('non-text embeddings inputs are rejected by text-only providers', function (): void {
+        Embeddings::for([
+            Image::fromBase64(base64_encode('image-bytes'), 'image/png'),
+        ])->generate(provider: 'openai');
+    })->throws(InvalidArgumentException::class, 'Provider [openai] only supports text embeddings inputs.');
+
+    test('can fake embeddings with custom response', function (): void {
         $customEmbedding = array_fill(0, 100, 0.5);
 
         Embeddings::fake([
@@ -50,162 +150,257 @@ class EmbeddingsFakeTest extends TestCase
 
         $response = Embeddings::for(['Hello world'])->dimensions(100)->generate();
 
-        $this->assertEquals($customEmbedding, $response->first());
-    }
+        expect($response->first())->toEqual($customEmbedding);
+    });
 
-    public function test_can_fake_embeddings_with_closure(): void
-    {
-        Embeddings::fake(function (EmbeddingsPrompt $prompt) {
-            return array_map(
-                fn () => array_fill(0, $prompt->dimensions, 0.1),
-                $prompt->inputs
-            );
-        });
+    test('can fake embeddings with closure', function (): void {
+        Embeddings::fake(fn (EmbeddingsPrompt $prompt): array => array_map(
+            fn (): array => array_fill(0, $prompt->dimensions, 0.1),
+            $prompt->inputs
+        ));
 
         $response = Embeddings::for(['Hello', 'World'])->dimensions(256)->generate();
 
-        $this->assertCount(2, $response);
-        $this->assertCount(256, $response->first());
-    }
+        expect($response)->toHaveCount(2)
+            ->and($response->first())->toHaveCount(256);
+    });
 
-    public function test_embeddings_timeout_defaults_to_sdk_fallback(): void
-    {
+    test('embeddings timeout defaults to sdk fallback', function (): void {
         Embeddings::fake();
 
         Embeddings::for(['Hello world'])->generate();
 
-        Embeddings::assertGenerated(fn (EmbeddingsPrompt $prompt) => $prompt->timeout === 30);
-    }
+        Embeddings::assertGenerated(fn (EmbeddingsPrompt $prompt): bool => $prompt->timeout === 30);
+    });
 
-    public function test_fake_embeddings_closure_receives_timeout(): void
-    {
-        Embeddings::fake(function (EmbeddingsPrompt $prompt) {
-            $this->assertSame(45, $prompt->timeout);
+    test('fake embeddings closure receives timeout', function (): void {
+        Embeddings::fake(function (EmbeddingsPrompt $prompt): array {
+            expect($prompt->timeout)->toBe(45);
 
             return array_map(
-                fn () => array_fill(0, $prompt->dimensions, 0.1),
+                fn (): array => array_fill(0, $prompt->dimensions, 0.1),
                 $prompt->inputs
             );
         });
 
         Embeddings::for(['Hello world'])->timeout(45)->generate();
-    }
+    });
 
-    public function test_can_assert_embeddings_generated(): void
-    {
+    test('fake embeddings prompt carries provider options', function (): void {
         Embeddings::fake();
 
-        Embeddings::for(['Hello world'])->generate();
+        Embeddings::for(['Hello'])
+            ->withProviderOptions(['input_type' => 'search_query'])
+            ->generate();
 
-        Embeddings::assertGenerated(function (EmbeddingsPrompt $prompt) {
-            return in_array('Hello world', $prompt->inputs);
-        });
-    }
+        Embeddings::assertGenerated(
+            fn (EmbeddingsPrompt $prompt): bool => $prompt->providerOptions === ['input_type' => 'search_query'],
+        );
+    });
 
-    public function test_can_assert_embeddings_not_generated(): void
-    {
+    test('fake queued embeddings prompt carries provider options', function (): void {
         Embeddings::fake();
 
-        Embeddings::for(['Hello world'])->generate();
+        Embeddings::for(['Hello'])
+            ->withProviderOptions(['input_type' => 'search_query'])
+            ->queue();
 
-        Embeddings::assertNotGenerated(function (EmbeddingsPrompt $prompt) {
-            return in_array('Goodbye', $prompt->inputs);
-        });
-    }
+        Embeddings::assertQueued(
+            fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->providerOptions === ['input_type' => 'search_query'],
+        );
+    });
 
-    public function test_can_assert_nothing_generated(): void
-    {
-        Embeddings::fake();
-
-        Embeddings::assertNothingGenerated();
-    }
-
-    public function test_fake_embeddings_are_normalized(): void
-    {
+    test('fake embeddings are normalized', function (): void {
         $embedding = Embeddings::fakeEmbedding(100);
 
         // Check it has the right dimensions...
-        $this->assertCount(100, $embedding);
+        expect($embedding)->toHaveCount(100);
 
         // Check it's normalized (magnitude ~= 1)...
-        $magnitude = sqrt(array_sum(array_map(fn ($v) => $v * $v, $embedding)));
-        $this->assertEqualsWithDelta(1.0, $magnitude, 0.0001);
-    }
+        $magnitude = sqrt(array_sum(array_map(fn ($v): int|float => $v * $v, $embedding)));
+        expect($magnitude)->toEqualWithDelta(1.0, 0.0001);
+    });
 
-    public function test_can_prevent_stray_embeddings_generations(): void
-    {
-        $this->expectException(RuntimeException::class);
-
+    test('can prevent stray embeddings generations', function (): void {
         Embeddings::fake()->preventStrayEmbeddings();
 
         Embeddings::for(['Hello world'])->generate();
-    }
+    })->throws(RuntimeException::class);
+});
 
-    public function test_queued_embeddings_can_be_faked(): void
-    {
+describe('assertions', function (): void {
+    test('can assert embeddings generated', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for(['Hello world'])->generate();
+
+        Embeddings::assertGenerated(fn (EmbeddingsPrompt $prompt): bool => in_array('Hello world', $prompt->inputs));
+    });
+
+    test('can assert embeddings not generated', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for(['Hello world'])->generate();
+
+        Embeddings::assertNotGenerated(fn (EmbeddingsPrompt $prompt): bool => in_array('Goodbye', $prompt->inputs));
+    });
+
+    test('can assert nothing generated', function (): void {
+        Embeddings::fake();
+
+        Embeddings::assertNothingGenerated();
+    });
+});
+
+describe('queued embeddings', function (): void {
+    test('queued embeddings can be faked', function (): void {
         Embeddings::fake();
 
         Embeddings::for(['Hello world'])->queue();
 
-        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt) => $prompt->contains('Hello'));
-        Embeddings::assertNotQueued(fn (QueuedEmbeddingsPrompt $prompt) => $prompt->contains('Goodbye'));
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->contains('Hello'));
+        Embeddings::assertNotQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->contains('Goodbye'));
 
-        Embeddings::assertQueued(function (QueuedEmbeddingsPrompt $prompt) {
-            return in_array('Hello world', $prompt->inputs);
-        });
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => in_array('Hello world', $prompt->inputs));
 
-        Embeddings::assertNotQueued(function (QueuedEmbeddingsPrompt $prompt) {
-            return in_array('Goodbye', $prompt->inputs);
-        });
-    }
+        Embeddings::assertNotQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => in_array('Goodbye', $prompt->inputs));
+    });
 
-    public function test_can_assert_no_embeddings_were_queued(): void
-    {
+    test('contains ignores non-text inputs', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for([
+            Image::fromBase64(base64_encode('image-bytes'), 'image/png'),
+        ])->generate();
+
+        Embeddings::assertGenerated(fn (EmbeddingsPrompt $prompt) => ! $prompt->contains('Hello'));
+    });
+
+    test('queued contains ignores non-text inputs', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for([
+            Video::fromBase64(base64_encode('video-bytes'), 'video/mp4'),
+        ])->queue();
+
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt) => ! $prompt->contains('Hello'));
+    });
+
+    test('can assert no embeddings were queued', function (): void {
         Embeddings::fake();
 
         Embeddings::assertNothingQueued();
-    }
+    });
 
-    public function test_generate_accepts_ai_provider_enum(): void
-    {
-        Embeddings::fake();
-
-        Embeddings::for(['Enum test'])->generate(provider: Lab::OpenAI);
-
-        Embeddings::assertGenerated(function (EmbeddingsPrompt $prompt) {
-            return in_array('Enum test', $prompt->inputs);
-        });
-    }
-
-    public function test_queued_embeddings_accept_ai_provider_enum(): void
-    {
-        Embeddings::fake();
-
-        Embeddings::for(['Queued enum'])->queue(provider: Lab::Gemini);
-
-        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt) => $prompt->contains('Queued enum')
-            && $prompt->provider === Lab::Gemini);
-    }
-
-    public function test_queued_embeddings_dimensions_are_recorded(): void
-    {
+    test('queued embeddings dimensions are recorded', function (): void {
         Embeddings::fake();
 
         Embeddings::for(['Hello world'])->dimensions(256)->queue();
 
-        Embeddings::assertQueued(function (QueuedEmbeddingsPrompt $prompt) {
-            return $prompt->dimensions === 256 && $prompt->count() === 1;
-        });
-    }
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->dimensions === 256 && $prompt->count() === 1);
+    });
 
-    public function test_queued_embeddings_timeout_is_recorded(): void
-    {
+    test('queued embeddings timeout is recorded', function (): void {
         Embeddings::fake();
 
         Embeddings::for(['Hello world'])->timeout(90)->queue();
 
-        Embeddings::assertQueued(function (QueuedEmbeddingsPrompt $prompt) {
-            return $prompt->timeout === 90 && $prompt->count() === 1;
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->timeout === 90 && $prompt->count() === 1);
+    });
+
+    test('cached embeddings with media inputs use content hashes', function () {
+        config([
+            'cache.default' => 'array',
+            'ai.caching.embeddings.store' => 'array',
+        ]);
+
+        $path = tempnam(sys_get_temp_dir(), 'ai-embedding-');
+
+        file_put_contents($path, 'first-version');
+
+        try {
+            $calls = 0;
+
+            Embeddings::fake(function (EmbeddingsPrompt $prompt) use (&$calls) {
+                $calls++;
+
+                return array_map(
+                    fn () => array_fill(0, $prompt->dimensions, 0.1),
+                    $prompt->inputs
+                );
+            });
+
+            $request = fn () => Embeddings::for([
+                Document::fromPath($path),
+            ])->cache(60)->generate();
+
+            $request();
+            $request();
+
+            file_put_contents($path, 'second-version');
+
+            $request();
+
+            expect($calls)->toBe(2);
+        } finally {
+            @unlink($path);
+        }
+    });
+
+    test('cached remote embeddings do not fetch remote metadata', function () {
+        config([
+            'cache.default' => 'array',
+            'ai.caching.embeddings.store' => 'array',
+        ]);
+
+        Http::preventStrayRequests();
+
+        $calls = 0;
+
+        Embeddings::fake(function () use (&$calls) {
+            $calls++;
+
+            return [array_fill(0, 100, 0.1)];
         });
-    }
-}
+
+        $request = fn () => Embeddings::for([
+            Document::fromUrl('https://example.com/manual.pdf'),
+        ])->cache(60)->generate();
+
+        $request();
+        $request();
+
+        expect($calls)->toBe(1);
+        Http::assertNothingSent();
+    });
+
+    test('cached embeddings reject unsupported input types with an invalid argument exception', function () {
+        config([
+            'cache.default' => 'array',
+            'ai.caching.embeddings.store' => 'array',
+        ]);
+
+        Embeddings::fake();
+
+        Embeddings::for([123])->cache(60)->generate();
+    })->throws(InvalidArgumentException::class, 'The input at index 0 must be a string or an image, audio, document, or video file.');
+});
+
+describe('provider enum support', function (): void {
+    test('generate accepts ai provider enum', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for(['Enum test'])->generate(provider: Lab::OpenAI);
+
+        Embeddings::assertGenerated(fn (EmbeddingsPrompt $prompt): bool => in_array('Enum test', $prompt->inputs));
+    });
+
+    test('queued embeddings accept ai provider enum', function (): void {
+        Embeddings::fake();
+
+        Embeddings::for(['Queued enum'])->queue(provider: Lab::Gemini);
+
+        Embeddings::assertQueued(fn (QueuedEmbeddingsPrompt $prompt): bool => $prompt->contains('Queued enum')
+            && $prompt->provider === Lab::Gemini);
+    });
+});

@@ -4,6 +4,7 @@ namespace Laravel\Ai;
 
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\MultipleInstanceManager;
+use InvalidArgumentException;
 use Laravel\Ai\Contracts\Agent;
 use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
@@ -15,10 +16,11 @@ use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
 use Laravel\Ai\Enums\Lab;
 use Laravel\Ai\Gateway\Anthropic\AnthropicGateway;
+use Laravel\Ai\Gateway\Gemini\GeminiGateway;
 use Laravel\Ai\Gateway\OpenAi\OpenAiGateway;
-use Laravel\Ai\Gateway\Prism\PrismGateway;
 use Laravel\Ai\Providers\AnthropicProvider;
 use Laravel\Ai\Providers\AzureOpenAiProvider;
+use Laravel\Ai\Providers\BedrockProvider;
 use Laravel\Ai\Providers\CohereProvider;
 use Laravel\Ai\Providers\DeepSeekProvider;
 use Laravel\Ai\Providers\ElevenLabsProvider;
@@ -27,6 +29,7 @@ use Laravel\Ai\Providers\GroqProvider;
 use Laravel\Ai\Providers\JinaProvider;
 use Laravel\Ai\Providers\MistralProvider;
 use Laravel\Ai\Providers\OllamaProvider;
+use Laravel\Ai\Providers\OpenAiCompatibleProvider;
 use Laravel\Ai\Providers\OpenAiProvider;
 use Laravel\Ai\Providers\OpenRouterProvider;
 use Laravel\Ai\Providers\Provider;
@@ -59,7 +62,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function audioProvider(?string $name = null): AudioProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof AudioProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support audio generation.');
             }
@@ -87,7 +90,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function embeddingProvider(?string $name = null): EmbeddingProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof EmbeddingProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support embedding generation.');
             }
@@ -115,7 +118,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function rerankingProvider(?string $name = null): RerankingProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof RerankingProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support reranking.');
             }
@@ -143,7 +146,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function imageProvider(?string $name = null): ImageProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof ImageProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support image generation.');
             }
@@ -171,7 +174,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function textProvider(?string $name = null): TextProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof TextProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support text generation.');
             }
@@ -199,7 +202,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function transcriptionProvider(?string $name = null): TranscriptionProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof TranscriptionProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support transcription generation.');
             }
@@ -227,7 +230,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function fileProvider(?string $name = null): FileProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof FileProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support file management.');
             }
@@ -255,7 +258,7 @@ class AiManager extends MultipleInstanceManager
      */
     public function storeProvider(?string $name = null): StoreProvider
     {
-        return tap($this->instance($name), function ($instance) {
+        return tap($this->instance($name), function ($instance): void {
             if (! $instance instanceof StoreProvider) {
                 throw new LogicException('Provider ['.$instance::class.'] does not support store management.');
             }
@@ -294,7 +297,17 @@ class AiManager extends MultipleInstanceManager
     public function createAzureDriver(array $config): AzureOpenAiProvider
     {
         return new AzureOpenAiProvider(
-            new PrismGateway($this->app['events']),
+            $config,
+            $this->app->make(Dispatcher::class)
+        );
+    }
+
+    /**
+     * Create an AWS Bedrock powered instance.
+     */
+    public function createBedrockDriver(array $config): BedrockProvider
+    {
+        return new BedrockProvider(
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -317,7 +330,6 @@ class AiManager extends MultipleInstanceManager
     public function createDeepseekDriver(array $config): DeepSeekProvider
     {
         return new DeepSeekProvider(
-            new PrismGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -340,7 +352,7 @@ class AiManager extends MultipleInstanceManager
     public function createGeminiDriver(array $config): GeminiProvider
     {
         return new GeminiProvider(
-            new PrismGateway($this->app['events']),
+            new GeminiGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -374,7 +386,6 @@ class AiManager extends MultipleInstanceManager
     public function createMistralDriver(array $config): MistralProvider
     {
         return new MistralProvider(
-            new PrismGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -386,7 +397,6 @@ class AiManager extends MultipleInstanceManager
     public function createOllamaDriver(array $config): OllamaProvider
     {
         return new OllamaProvider(
-            new PrismGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -405,12 +415,22 @@ class AiManager extends MultipleInstanceManager
     }
 
     /**
+     * Create an OpenAI-compatible powered instance.
+     */
+    public function createOpenaiCompatibleDriver(array $config): OpenAiCompatibleProvider
+    {
+        return new OpenAiCompatibleProvider(
+            $config,
+            $this->app->make(Dispatcher::class)
+        );
+    }
+
+    /**
      * Create an OpenRouter powered instance.
      */
     public function createOpenrouterDriver(array $config): OpenRouterProvider
     {
         return new OpenRouterProvider(
-            new PrismGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -422,7 +442,6 @@ class AiManager extends MultipleInstanceManager
     public function createVoyageaiDriver(array $config): VoyageAiProvider
     {
         return new VoyageAiProvider(
-            new PrismGateway($this->app['events']),
             $config,
             $this->app->make(Dispatcher::class)
         );
@@ -434,9 +453,8 @@ class AiManager extends MultipleInstanceManager
     public function createXaiDriver(array $config): XaiProvider
     {
         return new XaiProvider(
-            new PrismGateway($this->app['events']),
             $config,
-            $this->app->make(Dispatcher::class)
+            $this->app->make(Dispatcher::class),
         );
     }
 
@@ -447,7 +465,15 @@ class AiManager extends MultipleInstanceManager
     {
         $default = $this->app['config']['ai.default'];
 
-        return $default instanceof Lab ? $default->value : $default;
+        if ($default instanceof Lab) {
+            return $default->value;
+        }
+
+        if (is_array($default)) {
+            throw new InvalidArgumentException('The "ai.default" config value must be a string provider name or a Lab enum, not an array.');
+        }
+
+        return $default;
     }
 
     /**

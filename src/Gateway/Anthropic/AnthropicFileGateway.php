@@ -3,11 +3,11 @@
 namespace Laravel\Ai\Gateway\Anthropic;
 
 use Illuminate\Http\Client\PendingRequest;
-use Illuminate\Support\Facades\Http;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Contracts\Gateway\FileGateway;
 use Laravel\Ai\Contracts\Providers\FileProvider;
-use Laravel\Ai\Gateway\Concerns\HandlesRateLimiting;
+use Laravel\Ai\Enums\Lab;
+use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Gateway\Concerns\PreparesStorableFiles;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\FileResponse;
@@ -16,7 +16,7 @@ use Laravel\Ai\Responses\StoredFileResponse;
 class AnthropicFileGateway implements FileGateway
 {
     use Concerns\CreatesAnthropicClient;
-    use HandlesRateLimiting;
+    use HandlesFailoverErrors;
     use PreparesStorableFiles;
 
     /**
@@ -24,7 +24,7 @@ class AnthropicFileGateway implements FileGateway
      */
     public function getFile(FileProvider $provider, string $fileId): FileResponse
     {
-        $response = $this->withRateLimitHandling(
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)->get("files/{$fileId}"),
         );
@@ -44,11 +44,13 @@ class AnthropicFileGateway implements FileGateway
     ): StoredFileResponse {
         [$content, $mime, $name] = $this->prepareStorableFile($file);
 
-        $response = $this->withRateLimitHandling(
+        $providerOptions = $this->resolveProviderOptions($file, Lab::Anthropic);
+
+        $response = $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)
                 ->attach('file', $content, $name, ['Content-Type' => $mime])
-                ->post('files'),
+                ->post('files', $providerOptions),
         );
 
         return new StoredFileResponse($response->json('id'));
@@ -59,7 +61,7 @@ class AnthropicFileGateway implements FileGateway
      */
     public function deleteFile(FileProvider $provider, string $fileId): void
     {
-        $this->withRateLimitHandling(
+        $this->withErrorHandling(
             $provider->name(),
             fn () => $this->client($provider)->delete("files/{$fileId}"),
         );
@@ -70,13 +72,25 @@ class AnthropicFileGateway implements FileGateway
      */
     protected function client(Provider $provider, ?int $timeout = null): PendingRequest
     {
-        return Http::baseUrl($this->baseUrl($provider))
-            ->withHeaders([
+        $config = $provider->additionalConfiguration();
+
+        return $this->createClient(
+            $this->baseUrl($provider),
+            array_filter([
                 'x-api-key' => $provider->providerCredentials()['key'],
-                'anthropic-version' => $provider->additionalConfiguration()['version'] ?? '2023-06-01',
+                'anthropic-version' => $config['version'] ?? '2023-06-01',
                 'anthropic-beta' => 'files-api-2025-04-14',
-            ])
-            ->timeout($timeout ?? 60)
-            ->throw();
+            ]),
+            $config['headers'] ?? [],
+            $timeout ?? 60,
+        );
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    protected function overloadedStatusCodes(): array
+    {
+        return [529];
     }
 }

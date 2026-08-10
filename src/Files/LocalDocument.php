@@ -4,6 +4,7 @@ namespace Laravel\Ai\Files;
 
 use Illuminate\Contracts\Support\Arrayable;
 use Illuminate\Filesystem\Filesystem;
+use InvalidArgumentException;
 use JsonSerializable;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files\Concerns\CanBeUploadedToProvider;
@@ -13,15 +14,19 @@ class LocalDocument extends Document implements Arrayable, JsonSerializable, Sto
 {
     use CanBeUploadedToProvider;
 
-    public ?string $mime = null;
-
     public function __construct(public string $path, ?string $mimeType = null)
     {
+        if (blank($path)) {
+            throw new InvalidArgumentException('Document file path cannot be empty.');
+        }
+
         $this->mime = $mimeType;
     }
 
     /**
      * Get the raw representation of the file.
+     *
+     * @throws RuntimeException if the file does not exist at the configured path.
      */
     public function content(): string
     {
@@ -37,6 +42,7 @@ class LocalDocument extends Document implements Arrayable, JsonSerializable, Sto
     /**
      * Get the displayable name of the file.
      */
+    #[\Override]
     public function name(): ?string
     {
         return $this->name ?? basename($this->path);
@@ -45,19 +51,10 @@ class LocalDocument extends Document implements Arrayable, JsonSerializable, Sto
     /**
      * Get the file's MIME type.
      */
+    #[\Override]
     public function mimeType(): ?string
     {
         return $this->mime ?? (new Filesystem)->mimeType($this->path);
-    }
-
-    /**
-     * Set the document's MIME type.
-     */
-    public function withMimeType(string $mimeType): static
-    {
-        $this->mime = $mimeType;
-
-        return $this;
     }
 
     /**
@@ -67,7 +64,7 @@ class LocalDocument extends Document implements Arrayable, JsonSerializable, Sto
     {
         return [
             'type' => 'local-document',
-            'name' => $this->name,
+            'name' => $this->name(),
             'path' => $this->path,
             'mime' => $this->mime,
         ];

@@ -3,6 +3,7 @@
 namespace Laravel\Ai\Files;
 
 use Illuminate\Contracts\Support\Arrayable;
+use InvalidArgumentException;
 use JsonSerializable;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Contracts\Files\TranscribableAudio;
@@ -13,12 +14,15 @@ use Laravel\Ai\Transcription;
 
 class RemoteAudio extends Audio implements Arrayable, JsonSerializable, StorableFile, TranscribableAudio
 {
-    use CanBeUploadedToProvider, HasRemoteContent;
-
-    public ?string $mime = null;
+    use CanBeUploadedToProvider;
+    use HasRemoteContent;
 
     public function __construct(public string $url, ?string $mimeType = null)
     {
+        if (blank($url)) {
+            throw new InvalidArgumentException('Remote audio URL cannot be empty.');
+        }
+
         $this->mime = $mimeType;
     }
 
@@ -37,7 +41,7 @@ class RemoteAudio extends Audio implements Arrayable, JsonSerializable, Storable
     {
         return [
             'type' => 'remote-audio',
-            'name' => $this->name,
+            'name' => $this->name(),
             'url' => $this->url,
             'mime' => $this->mime,
         ];

@@ -4,10 +4,8 @@ namespace Laravel\Ai\Gateway\Anthropic\Concerns;
 
 use Generator;
 use Illuminate\Support\Str;
-use Laravel\Ai\Gateway\TextGenerationOptions;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\Data\ToolCall;
-use Laravel\Ai\Responses\Data\ToolResult;
 use Laravel\Ai\Responses\Data\UrlCitation;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Streaming\Events\Citation as CitationEvent;
@@ -16,33 +14,24 @@ use Laravel\Ai\Streaming\Events\ProviderToolEvent;
 use Laravel\Ai\Streaming\Events\ReasoningDelta;
 use Laravel\Ai\Streaming\Events\ReasoningEnd;
 use Laravel\Ai\Streaming\Events\ReasoningStart;
-use Laravel\Ai\Streaming\Events\StreamEnd;
+use Laravel\Ai\Streaming\Events\StreamEvent;
 use Laravel\Ai\Streaming\Events\StreamStart;
 use Laravel\Ai\Streaming\Events\TextDelta;
 use Laravel\Ai\Streaming\Events\TextEnd;
 use Laravel\Ai\Streaming\Events\TextStart;
 use Laravel\Ai\Streaming\Events\ToolCall as ToolCallEvent;
-use Laravel\Ai\Streaming\Events\ToolResult as ToolResultEvent;
 
 trait HandlesTextStreaming
 {
     /**
-     * Process an Anthropic streaming response and yield Laravel stream events.
+     * Process a single Anthropic streaming turn and yield Laravel stream events.
      */
     protected function processTextStream(
         string $invocationId,
         Provider $provider,
         string $model,
-        array $tools,
-        ?array $schema,
-        ?TextGenerationOptions $options,
         $streamBody,
-        array $requestBody = [],
-        int $depth = 0,
-        ?int $maxSteps = null,
     ): Generator {
-        $maxSteps ??= $options?->maxSteps;
-
         $messageId = $this->generateEventId();
         $reasoningId = '';
         $streamStartEmitted = false;
@@ -56,6 +45,7 @@ trait HandlesTextStreaming
         $currentThinkingText = '';
         $currentSignature = '';
         $currentToolIndex = -1;
+        $currentServerToolInput = '';
         $pendingToolCalls = [];
         $responseContent = [];
 
@@ -65,7 +55,7 @@ trait HandlesTextStreaming
         $usage = null;
         $stopReason = '';
 
-        $emitTextStart = function () use (&$textStartEmitted, $messageId, $invocationId) {
+        $emitTextStart = function () use (&$textStartEmitted, $messageId, $invocationId): ?\Laravel\Ai\Streaming\Events\StreamEvent {
             if ($textStartEmitted) {
                 return null;
             }
@@ -79,7 +69,7 @@ trait HandlesTextStreaming
             ))->withInvocationId($invocationId);
         };
 
-        $emitReasoningStart = function () use (&$reasoningStartEmitted, &$reasoningId, $invocationId) {
+        $emitReasoningStart = function () use (&$reasoningStartEmitted, &$reasoningId, $invocationId): ?\Laravel\Ai\Streaming\Events\StreamEvent {
             if ($reasoningStartEmitted) {
                 return null;
             }
@@ -135,14 +125,14 @@ trait HandlesTextStreaming
                 if ($blockType === 'text') {
                     $currentBlockText = '';
 
-                    if ($event = $emitTextStart()) {
+                    if (($event = $emitTextStart()) instanceof StreamEvent) {
                         yield $event;
                     }
                 } elseif ($blockType === 'thinking') {
                     $currentThinkingText = '';
                     $currentSignature = '';
 
-                    if ($event = $emitReasoningStart()) {
+                    if (($event = $emitReasoningStart()) instanceof StreamEvent) {
                         yield $event;
                     }
                 } elseif ($blockType === 'tool_use') {
@@ -154,6 +144,8 @@ trait HandlesTextStreaming
                         'arguments' => '',
                     ];
                 } elseif ($blockType === 'server_tool_use') {
+                    $currentServerToolInput = '';
+
                     yield (new ProviderToolEvent(
                         $this->generateEventId(),
                         $data['content_block']['id'] ?? '',
@@ -188,7 +180,7 @@ trait HandlesTextStreaming
                     $textDelta = (string) ($data['delta']['text'] ?? '');
 
                     if ($textDelta !== '') {
-                        if ($event = $emitTextStart()) {
+                        if (($event = $emitTextStart()) instanceof StreamEvent) {
                             yield $event;
                         }
 
@@ -206,7 +198,7 @@ trait HandlesTextStreaming
                     $delta = (string) ($data['delta']['thinking'] ?? '');
 
                     if ($delta !== '') {
-                        if ($event = $emitReasoningStart()) {
+                        if (($event = $emitReasoningStart()) instanceof StreamEvent) {
                             yield $event;
                         }
 
@@ -232,11 +224,13 @@ trait HandlesTextStreaming
                             time(),
                         ))->withInvocationId($invocationId);
                     }
-                } elseif ($deltaType === 'input_json_delta' && $currentBlockType === 'tool_use') {
-                    $partial = $data['delta']['partial_json'] ?? '';
+                } elseif ($deltaType === 'input_json_delta') {
+                    $partial = (string) ($data['delta']['partial_json'] ?? '');
 
-                    if ($currentToolIndex >= 0 && isset($pendingToolCalls[$currentToolIndex])) {
+                    if ($currentBlockType === 'tool_use' && $currentToolIndex >= 0 && isset($pendingToolCalls[$currentToolIndex])) {
                         $pendingToolCalls[$currentToolIndex]['arguments'] .= $partial;
+                    } elseif ($currentBlockType === 'server_tool_use') {
+                        $currentServerToolInput .= $partial;
                     }
                 }
 
@@ -280,9 +274,6 @@ trait HandlesTextStreaming
                         $responseContent[$index]['input'] = $parsedArguments;
                     }
 
-                    // Store parsed arguments to avoid re-decoding in mapStreamToolCalls...
-                    $pendingToolCalls[$currentToolIndex]['parsed_arguments'] = $parsedArguments;
-
                     yield (new ToolCallEvent(
                         $this->generateEventId(),
                         new ToolCall(
@@ -295,6 +286,10 @@ trait HandlesTextStreaming
                     ))->withInvocationId($invocationId);
                 } elseif ($currentBlockType === 'server_tool_use') {
                     $index = $data['index'] ?? count($responseContent) - 1;
+
+                    if ($currentServerToolInput !== '' && isset($responseContent[$index])) {
+                        $responseContent[$index]['input'] = json_decode($currentServerToolInput, true) ?? [];
+                    }
 
                     yield (new ProviderToolEvent(
                         $this->generateEventId(),
@@ -324,141 +319,14 @@ trait HandlesTextStreaming
             }
         }
 
-        if (filled($pendingToolCalls) && $stopReason === 'tool_use') {
-            yield from $this->handleStreamingToolCalls(
-                $invocationId,
-                $provider,
-                $model,
-                $tools,
-                $schema,
-                $options,
-                $pendingToolCalls,
-                $responseContent,
-                $requestBody,
-                $depth,
-                $maxSteps,
-            );
-
-            return;
-        }
-
-        yield (new StreamEnd(
-            $this->generateEventId(),
-            'stop',
-            $usage ?? new Usage(0, 0),
-            time(),
-        ))->withInvocationId($invocationId);
-    }
-
-    /**
-     * Handle tool calls detected during streaming.
-     */
-    protected function handleStreamingToolCalls(
-        string $invocationId,
-        Provider $provider,
-        string $model,
-        array $tools,
-        ?array $schema,
-        ?TextGenerationOptions $options,
-        array $pendingToolCalls,
-        array $responseContent,
-        array $requestBody,
-        int $depth,
-        ?int $maxSteps,
-    ): Generator {
-        $mappedToolCalls = $this->mapStreamToolCalls($pendingToolCalls);
-
-        $toolResults = [];
-
-        foreach ($mappedToolCalls as $toolCall) {
-            $tool = $this->findTool($toolCall->name, $tools);
-
-            if ($tool === null) {
-                continue;
-            }
-
-            $result = $this->executeTool($tool, $toolCall->arguments);
-
-            $toolResult = new ToolResult(
-                $toolCall->id,
-                $toolCall->name,
-                $toolCall->arguments,
-                $result,
-                $toolCall->resultId,
-            );
-
-            $toolResults[] = $toolResult;
-
-            yield (new ToolResultEvent(
-                $this->generateEventId(),
-                $toolResult,
-                true,
-                null,
-                time(),
-            ))->withInvocationId($invocationId);
-        }
-
-        if ($depth + 1 >= ($maxSteps ?? round(count($tools) * 1.5))) {
-            yield (new StreamEnd(
-                $this->generateEventId(),
-                'stop',
-                new Usage(0, 0),
-                time(),
-            ))->withInvocationId($invocationId);
-
-            return;
-        }
-
-        $requestBody['messages'][] = [
-            'role' => 'assistant',
-            'content' => $this->ensureToolInputIsObject(array_values($responseContent)),
-        ];
-
-        $requestBody['messages'][] = [
-            'role' => 'user',
-            'content' => array_map(fn (ToolResult $result) => [
-                'type' => 'tool_result',
-                'tool_use_id' => $result->id,
-                'content' => $this->serializeToolResultOutput($result->result),
-            ], $toolResults),
-        ];
-
-        $requestBody['stream'] = true;
-
-        $response = $this->withRateLimitHandling(
-            $provider->name(),
-            fn () => $this->client($provider)
-                ->withOptions(['stream' => true])
-                ->post('messages', $requestBody),
+        return $this->buildStepResponse(
+            content: array_values($responseContent),
+            provider: $provider,
+            model: $model,
+            usage: $usage ?? new Usage(0, 0),
+            finishReason: $this->extractFinishReason(['stop_reason' => $stopReason]),
+            structured: false,
         );
-
-        yield from $this->processTextStream(
-            $invocationId,
-            $provider,
-            $model,
-            $tools,
-            $schema,
-            $options,
-            $response->getBody(),
-            $requestBody,
-            $depth + 1,
-            $maxSteps,
-        );
-    }
-
-    /**
-     * Map raw streaming tool call data to ToolCall DTOs.
-     *
-     * @return array<ToolCall>
-     */
-    protected function mapStreamToolCalls(array $toolCalls): array
-    {
-        return array_map(fn (array $tc) => new ToolCall(
-            $tc['id'] ?? '',
-            $tc['name'] ?? '',
-            $tc['parsed_arguments'] ?? json_decode($tc['arguments'] ?? '{}', true) ?? [],
-            $tc['id'] ?? null,
-        ), array_values($toolCalls));
     }
 
     /**

@@ -10,6 +10,7 @@ use IteratorAggregate;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Streaming\Events\StreamEnd;
+use Laravel\Ai\Streaming\Events\StreamEvent;
 use Laravel\Ai\Streaming\Events\TextDelta;
 use Symfony\Component\HttpFoundation\Response;
 use Traversable;
@@ -18,10 +19,11 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
 {
     use Concerns\CanStreamUsingVercelProtocol;
 
-    public ?string $text;
+    public ?string $text = null;
 
-    public ?Usage $usage;
+    public ?Usage $usage = null;
 
+    /** @var Collection<int, StreamEvent> */
     public Collection $events;
 
     public ?string $conversationId = null;
@@ -31,6 +33,8 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
     protected array $thenCallbacks = [];
 
     protected bool $usesVercelProtocol = false;
+
+    protected ?string $vercelProtocolMessageId = null;
 
     protected ?StreamedAgentResponse $streamedResponse = null;
 
@@ -62,8 +66,10 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
     public function then(callable $callback): self
     {
         // If the response has already been iterated / streamed, invoke now...
-        if ($this->streamedResponse) {
+        if ($this->streamedResponse instanceof StreamedAgentResponse) {
             $callback($this->streamedResponse);
+
+            $this->syncConversationFromStreamedResponse();
 
             return $this;
         }
@@ -85,13 +91,32 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
     }
 
     /**
+     * Adopt state from a completed streamed response.
+     */
+    public function adoptStateFrom(StreamedAgentResponse $response): self
+    {
+        if ($this->meta instanceof Meta) {
+            $this->meta->provider = $response->meta->provider;
+            $this->meta->model = $response->meta->model;
+            $this->meta->citations = $response->meta->citations;
+        }
+
+        if ($response->conversationId !== null) {
+            $this->withinConversation($response->conversationId, $response->conversationUser);
+        }
+
+        return $this;
+    }
+
+    /**
      * Stream the response using Vercel's AI SDK stream protocol.
      *
      * See: https://ai-sdk.dev/docs/ai-sdk-ui/stream-protocol
      */
-    public function usingVercelDataProtocol(bool $value = true): self
+    public function usingVercelDataProtocol(bool $value = true, ?string $messageId = null): self
     {
         $this->usesVercelProtocol = $value;
+        $this->vercelProtocolMessageId = $messageId;
 
         return $this;
     }
@@ -109,7 +134,7 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
 
         return response()->stream(function () {
             foreach ($this as $event) {
-                yield 'data: '.((string) $event)."\n\n";
+                yield 'data: '.($event)."\n\n";
             }
 
             yield "data: [DONE]\n\n";
@@ -149,8 +174,27 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
             $this->meta,
         );
 
+        if ($this->conversationId !== null) {
+            $this->streamedResponse->withinConversation(
+                $this->conversationId,
+                $this->conversationUser
+            );
+        }
+
         foreach ($this->thenCallbacks as $callback) {
             call_user_func($callback, $this->streamedResponse);
         }
+
+        $this->syncConversationFromStreamedResponse();
+    }
+
+    protected function syncConversationFromStreamedResponse(): void
+    {
+        if ($this->streamedResponse->conversationId === null) {
+            return;
+        }
+
+        $this->conversationId = $this->streamedResponse->conversationId;
+        $this->conversationUser = $this->streamedResponse->conversationUser;
     }
 }

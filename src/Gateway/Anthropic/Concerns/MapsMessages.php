@@ -54,6 +54,15 @@ trait MapsMessages
      */
     protected function mapAssistantMessage(AssistantMessage|Message $message, array &$mapped): void
     {
+        if ($message instanceof AssistantMessage && filled($message->providerContentBlocks)) {
+            $mapped[] = [
+                'role' => 'assistant',
+                'content' => $this->ensureToolInputIsObject($message->providerContentBlocks),
+            ];
+
+            return;
+        }
+
         $content = [];
         $hasToolCalls = $message instanceof AssistantMessage && $message->toolCalls->isNotEmpty();
 
@@ -61,7 +70,7 @@ trait MapsMessages
             $thinkingBlocks = $message->toolCalls
                 ->whereNotNull('reasoningId')
                 ->unique('reasoningId')
-                ->map(fn ($toolCall) => [
+                ->map(fn ($toolCall): array => [
                     'type' => 'thinking',
                     'thinking' => is_array($toolCall->reasoningSummary)
                         ? implode("\n", array_column($toolCall->reasoningSummary, 'text'))
@@ -86,7 +95,7 @@ trait MapsMessages
                     'type' => 'tool_use',
                     'id' => $toolCall->id,
                     'name' => $toolCall->name,
-                    'input' => $toolCall->arguments,
+                    'input' => $toolCall->arguments ?: (object) [],
                 ];
             }
         }
@@ -122,5 +131,31 @@ trait MapsMessages
             'role' => 'user',
             'content' => $content,
         ];
+    }
+
+    /**
+     * Ensure tool_use and server_tool_use content blocks encode empty input as an object for replay.
+     */
+    protected function ensureToolInputIsObject(array $content): array
+    {
+        return array_map(function (array $block): array {
+            if (in_array($block['type'] ?? '', ['tool_use', 'server_tool_use'], true)) {
+                $block['input'] = (object) ($block['input'] ?? []);
+            }
+
+            return $block;
+        }, $content);
+    }
+
+    /**
+     * Serialize a tool result output value to a string.
+     */
+    protected function serializeToolResultOutput(mixed $output): string
+    {
+        return match (true) {
+            is_string($output) => $output,
+            is_array($output) => json_encode($output),
+            default => strval($output),
+        };
     }
 }

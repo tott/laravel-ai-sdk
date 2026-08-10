@@ -2,6 +2,9 @@
 
 namespace Laravel\Ai\Responses;
 
+use Illuminate\Support\Collection;
+use Laravel\Ai\Approvals\PendingApproval;
+use Laravel\Ai\Messages\AssistantMessage;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\Usage;
 
@@ -21,9 +24,20 @@ class AgentResponse extends TextResponse
     }
 
     /**
+     * Create a fake response that is waiting for approval.
+     *
+     * @param  array<int, PendingApproval>|Collection<int, PendingApproval>  $pendingApprovals
+     */
+    public static function fakeWithPendingApprovals(array|Collection $pendingApprovals): self
+    {
+        return (new self('fake-invocation', '', new Usage, new Meta))
+            ->withPendingApprovals(Collection::make($pendingApprovals));
+    }
+
+    /**
      * Set the conversation UUID and participant for this response.
      */
-    public function withinConversation(string $conversationId, object $conversationUser): self
+    public function withinConversation(string $conversationId, ?object $conversationUser = null): self
     {
         $this->conversationId = $conversationId;
         $this->conversationUser = $conversationUser;
@@ -39,5 +53,19 @@ class AgentResponse extends TextResponse
         $callback($this);
 
         return $this;
+    }
+
+    /**
+     * Get the raw provider replay state for the paused assistant turn, if any.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function pausedProviderContentBlocks(): array
+    {
+        if (! $this->hasPendingApprovals()) {
+            return [];
+        }
+
+        return $this->messages->whereInstanceOf(AssistantMessage::class)->last()?->providerContentBlocks ?? [];
     }
 }

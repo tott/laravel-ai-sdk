@@ -1,83 +1,66 @@
 <?php
 
-namespace Tests\Feature;
-
-use DateInterval;
 use Illuminate\Support\Collection;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files;
 use Laravel\Ai\Files\Document;
 use Laravel\Ai\Files\ProviderDocument;
 use Laravel\Ai\Stores;
-use RuntimeException;
-use Tests\TestCase;
 
 use function Illuminate\Support\days;
 
-class StoreFakeTest extends TestCase
-{
-    public function test_stores_can_be_faked(): void
-    {
+describe('store operations', function (): void {
+    test('stores can be faked', function (): void {
         Stores::fake([
             'first-store',
-            fn ($storeId) => "store-{$storeId}",
+            fn ($storeId): string => "store-{$storeId}",
             'Custom Store',
         ]);
 
         $response = Stores::get('vs_1');
-        $this->assertEquals('vs_1', $response->id);
-        $this->assertEquals('first-store', $response->name);
+        expect($response)->id->toEqual('vs_1')->name->toEqual('first-store');
 
         $response = Stores::get('vs_2');
-        $this->assertEquals('vs_2', $response->id);
-        $this->assertEquals('store-vs_2', $response->name);
+        expect($response)->id->toEqual('vs_2')->name->toEqual('store-vs_2');
 
         $response = Stores::get('vs_3');
-        $this->assertEquals('vs_3', $response->id);
-        $this->assertEquals('Custom Store', $response->name);
-    }
+        expect($response)->id->toEqual('vs_3')->name->toEqual('Custom Store');
+    });
 
-    public function test_stores_can_be_faked_with_no_predefined_responses(): void
-    {
+    test('stores can be faked with no predefined responses', function (): void {
         Stores::fake();
 
         $response = Stores::get('vs_1');
 
-        $this->assertEquals('vs_1', $response->id);
-        $this->assertEquals('fake-store', $response->name);
-    }
+        expect($response)->id->toEqual('vs_1')->name->toEqual('fake-store');
+    });
 
-    public function test_stores_can_be_faked_with_a_closure(): void
-    {
-        Stores::fake(fn ($storeId) => "name-for-{$storeId}");
+    test('stores can be faked with a closure', function (): void {
+        Stores::fake(fn ($storeId): string => "name-for-{$storeId}");
 
         $response = Stores::get('vs_1');
 
-        $this->assertEquals('vs_1', $response->id);
-        $this->assertEquals('name-for-vs_1', $response->name);
-    }
+        expect($response)->id->toEqual('vs_1')->name->toEqual('name-for-vs_1');
+    });
 
-    public function test_stores_can_prevent_stray_operations(): void
-    {
-        $this->expectException(RuntimeException::class);
-
+    test('stores can prevent stray operations', function (): void {
         Stores::fake()->preventStrayOperations();
 
         Stores::get('vs_1');
-    }
+    })->throws(RuntimeException::class);
+});
 
-    public function test_can_assert_store_was_created_by_name(): void
-    {
+describe('store assertions', function (): void {
+    test('can assert store was created by name', function (): void {
         Stores::fake();
 
         Stores::create('My Vector Store');
 
         Stores::assertCreated('My Vector Store');
         Stores::assertNotCreated('Other Store');
-    }
+    });
 
-    public function test_can_assert_store_was_created_with_closure(): void
-    {
+    test('can assert store was created with closure', function (): void {
         Stores::fake();
 
         Stores::create(
@@ -86,92 +69,88 @@ class StoreFakeTest extends TestCase
             expiresWhenIdleFor: days(7),
         );
 
-        Stores::assertCreated(fn (string $name) => $name === 'My Vector Store');
-        Stores::assertCreated(fn (string $name, ?string $description) => $description === 'A test store');
+        Stores::assertCreated(fn (string $name): bool => $name === 'My Vector Store');
+        Stores::assertCreated(fn (string $name, ?string $description): bool => $description === 'A test store');
 
         Stores::assertCreated(fn (
             string $name,
             ?string $description,
             Collection $fileIds,
             ?DateInterval $expiresWhenIdleFor
-        ) => $expiresWhenIdleFor !== null);
+        ): bool => $expiresWhenIdleFor instanceof DateInterval);
 
-        Stores::assertNotCreated(fn (string $name) => $name === 'Other Store');
-    }
+        Stores::assertNotCreated(fn (string $name): bool => $name === 'Other Store');
+    });
 
-    public function test_can_assert_no_stores_were_created(): void
-    {
+    test('can assert no stores were created', function (): void {
         Stores::fake();
 
         Stores::assertNothingCreated();
-    }
+    });
 
-    public function test_can_assert_store_was_deleted(): void
-    {
+    test('can assert store was deleted', function (): void {
         Stores::fake();
 
         Stores::delete('vs_123');
 
         Stores::assertDeleted('vs_123');
-        Stores::assertDeleted(fn (string $id) => $id === 'vs_123');
+        Stores::assertDeleted(fn (string $id): bool => $id === 'vs_123');
 
         Stores::assertNotDeleted('vs_456');
-        Stores::assertNotDeleted(fn (string $id) => $id === 'vs_456');
-    }
+        Stores::assertNotDeleted(fn (string $id): bool => $id === 'vs_456');
+    });
 
-    public function test_can_assert_no_stores_were_deleted(): void
-    {
+    test('can assert no stores were deleted', function (): void {
         Stores::fake();
 
         Stores::assertNothingDeleted();
-    }
+    });
+});
 
-    public function test_can_add_file_to_store_with_provider_id(): void
-    {
+describe('file operations', function (): void {
+    test('can add file to store with provider id', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
 
         $searchable = $store->add(new ProviderDocument('file_123'));
 
-        $this->assertEquals('file_123', $searchable->id);
-        $this->assertEquals('file_123', $searchable->fileId());
-    }
+        expect($searchable)->id->toEqual('file_123')
+            ->and($searchable->fileId())->toEqual('file_123');
+    });
 
-    public function test_can_remove_file_from_store_with_provider_id(): void
-    {
+    test('can remove file from store with provider id', function (): void {
         Stores::fake();
 
         $result = Stores::create('My Store')->remove(new ProviderDocument('file_123'));
 
-        $this->assertTrue($result);
-    }
+        expect($result)->toBeTrue();
+    });
 
-    public function test_can_remove_file_from_store_with_string_id(): void
-    {
+    test('can remove file from store with string id', function (): void {
         Stores::fake();
 
         $result = Stores::create('My Store')->remove('file_123');
 
-        $this->assertTrue($result);
-    }
+        expect($result)->toBeTrue();
+    });
 
-    public function test_can_add_storable_file_to_store(): void
-    {
+    test('can add storable file to store', function (): void {
         Stores::fake();
 
         $response = Stores::create('My Store')
             ->add(Document::fromString('Hello, world!', 'text/plain'));
 
-        $this->assertNotEmpty($response);
+        expect($response)->not->toBeEmpty();
 
         Files::assertStored(
-            fn (StorableFile $file) => $file->content() === 'Hello, world!'
+            fn (StorableFile $file): bool => $file->content() === 'Hello, world!'
         );
-    }
+    });
+});
 
-    public function test_can_assert_file_added_to_store(): void
-    {
+describe('file assertions', function (): void {
+    test('can assert file added to store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -180,17 +159,16 @@ class StoreFakeTest extends TestCase
         $store->add($file);
 
         // Using closure receives the original file...
-        $store->assertAdded(fn ($f) => $f instanceof ProviderDocument && $f->id() === $file->id());
+        $store->assertAdded(fn ($f): bool => $f instanceof ProviderDocument && $f->id() === $file->id());
 
         // Using exact IDs...
         $store->assertAdded($file->id());
 
         // Using friendly names (automatically converted to fake IDs)...
         $store->assertAdded('test.txt');
-    }
+    });
 
-    public function test_can_assert_file_added_to_store_with_storable_file(): void
-    {
+    test('can assert file added to store with storable file', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -198,12 +176,11 @@ class StoreFakeTest extends TestCase
         $store->add(Document::fromString('Hello, world!', 'text/plain')->as('hello.txt'));
 
         // Using closure receives the original StorableFile...
-        $store->assertAdded(fn (StorableFile $file) => $file->name() === 'hello.txt');
-        $store->assertAdded(fn (StorableFile $file) => $file->content() === 'Hello, world!');
-    }
+        $store->assertAdded(fn (StorableFile $file): bool => $file->name() === 'hello.txt');
+        $store->assertAdded(fn (StorableFile $file): bool => $file->content() === 'Hello, world!');
+    });
 
-    public function test_can_assert_file_not_added_to_store(): void
-    {
+    test('can assert file not added to store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -211,11 +188,10 @@ class StoreFakeTest extends TestCase
 
         $store->add($file);
 
-        $store->assertNotAdded(fn ($f) => $f instanceof ProviderDocument && $f->id() === 'file_456');
-    }
+        $store->assertNotAdded(fn ($f): bool => $f instanceof ProviderDocument && $f->id() === 'file_456');
+    });
 
-    public function test_can_assert_file_removed_from_store(): void
-    {
+    test('can assert file removed from store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -224,23 +200,22 @@ class StoreFakeTest extends TestCase
         $store->remove($fileId);
 
         // Using closure...
-        $store->assertRemoved(fn ($fId) => $fId === $fileId);
+        $store->assertRemoved(fn ($fId): bool => $fId === $fileId);
 
         // Using exact IDs...
         $store->assertRemoved($fileId);
 
         // Using friendly names (automatically converted to fake IDs)...
         $store->assertRemoved('test.txt');
-    }
+    });
 
-    public function test_can_assert_file_not_removed_from_store(): void
-    {
+    test('can assert file not removed from store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
 
         $store->remove('file_123');
 
-        $store->assertNotRemoved(fn ($fileId) => $fileId === 'file_456');
-    }
-}
+        $store->assertNotRemoved(fn ($fileId): bool => $fileId === 'file_456');
+    });
+});

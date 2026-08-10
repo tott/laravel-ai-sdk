@@ -3,14 +3,20 @@
 namespace Laravel\Ai;
 
 use Closure;
+use Generator;
 use Illuminate\Broadcasting\Channel;
 use Illuminate\Container\Container;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Str;
+use InvalidArgumentException;
+use Laravel\Ai\Approvals\Decisions;
 use Laravel\Ai\Attributes\Model as ModelAttribute;
 use Laravel\Ai\Attributes\Provider as ProviderAttribute;
 use Laravel\Ai\Attributes\Timeout as TimeoutAttribute;
 use Laravel\Ai\Attributes\UseCheapestModel;
 use Laravel\Ai\Attributes\UseSmartestModel;
+use Laravel\Ai\Attributes\WithoutBroadcasting;
+use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Enums\Lab;
 use Laravel\Ai\Events\AgentFailedOver;
 use Laravel\Ai\Exceptions\FailoverableException;
@@ -20,8 +26,10 @@ use Laravel\Ai\Jobs\InvokeAgent;
 use Laravel\Ai\Prompts\AgentPrompt;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\AgentResponse;
+use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\QueuedAgentResponse;
 use Laravel\Ai\Responses\StreamableAgentResponse;
+use Laravel\Ai\Responses\StreamedAgentResponse;
 use Laravel\Ai\Streaming\Events\StreamEvent;
 use ReflectionClass;
 use RuntimeException;
@@ -36,54 +44,126 @@ trait Promptable
     public static function make(...$arguments): static
     {
         return match (true) {
-            ! empty($arguments) && ! array_is_list($arguments) => Container::getInstance()->makeWith(static::class, $arguments),
-            ! empty($arguments) => new static(...$arguments),
+            $arguments !== [] && ! array_is_list($arguments) => Container::getInstance()->makeWith(static::class, $arguments),
+            $arguments !== [] => new static(...$arguments),
             default => Container::getInstance()->make(static::class),
         };
     }
 
     /**
-     * Invoke the agent with a given prompt.
+     * Invoke the agent with a given prompt, or resume a paused run with tool approval decisions.
      */
     public function prompt(
-        string $prompt,
+        Decisions|string $prompt,
         array $attachments = [],
         Lab|array|string|null $provider = null,
         ?string $model = null,
         ?int $timeout = null): AgentResponse
     {
-        return $this->withModelFailover(
-            fn (Provider $provider, string $model) => $provider->prompt(
-                new AgentPrompt($this, $prompt, $attachments, $provider, $model, $this->getTimeout($timeout))
-            ),
-            $provider,
-            $model,
+        [$text, $approvalDecisions] = $this->extractPromptInput($prompt);
+
+        $run = fn (TextProvider $provider, string $model): AgentResponse => $provider->prompt(
+            new AgentPrompt($this, $text, $attachments, $provider, $model, $this->getTimeout($timeout), approvalDecisions: $approvalDecisions)
         );
+
+        if ($approvalDecisions !== null) {
+            [$provider, $model] = $this->iterateProvidersWithFailover(
+                $this->providersForApprovalContinuation($provider, $model)
+            )->current();
+
+            return $run($provider, $model);
+        }
+
+        return $this->withModelFailover($run, $provider, $model);
     }
 
     /**
      * Invoke the agent with a given prompt and return a streamable response.
      */
     public function stream(
-        string $prompt,
+        Decisions|string $prompt,
         array $attachments = [],
         Lab|array|string|null $provider = null,
         ?string $model = null,
         ?int $timeout = null): StreamableAgentResponse
     {
-        return $this->withModelFailover(
-            fn (Provider $provider, string $model) => $provider->stream(
-                new AgentPrompt($this, $prompt, $attachments, $provider, $model, $this->getTimeout($timeout))
-            ),
-            $provider,
-            $model,
+        [$text, $approvalDecisions] = $this->extractPromptInput($prompt);
+
+        return $this->streamPrompt($text, $approvalDecisions, $attachments, $provider, $model, $timeout);
+    }
+
+    /**
+     * Stream a text prompt or an approval continuation through the configured providers.
+     */
+    private function streamPrompt(
+        string $prompt,
+        ?Decisions $approvalDecisions,
+        array $attachments,
+        Lab|array|string|null $provider,
+        ?string $model,
+        ?int $timeout): StreamableAgentResponse
+    {
+        $providers = $approvalDecisions !== null
+            ? $this->providersForApprovalContinuation($provider, $model)
+            : $this->getProvidersAndModelsForFailover($provider, $model);
+        $resolvedTimeout = $this->getTimeout($timeout);
+
+        $invocationId = (string) Str::uuid7();
+
+        if (count($providers) === 1) {
+            [$resolved, $resolvedModel] = $this->iterateProvidersWithFailover($providers)->current();
+
+            return $resolved->stream(
+                new AgentPrompt($this, $prompt, $attachments, $resolved, $resolvedModel, $resolvedTimeout, $invocationId, $approvalDecisions)
+            );
+        }
+
+        $meta = new Meta;
+        $outer = null;
+
+        $outer = new StreamableAgentResponse(
+            $invocationId,
+            function () use ($providers, $prompt, $approvalDecisions, $attachments, $resolvedTimeout, $invocationId, &$outer) {
+                $lastException = null;
+
+                foreach ($this->iterateProvidersWithFailover($providers) as [$provider, $model]) {
+                    $started = false;
+
+                    try {
+                        $innerResponse = $provider->stream(
+                            new AgentPrompt($this, $prompt, $attachments, $provider, $model, $resolvedTimeout, $invocationId, $approvalDecisions)
+                        );
+
+                        $innerResponse->then(fn (StreamedAgentResponse $response): StreamableAgentResponse => $outer->adoptStateFrom($response));
+
+                        foreach ($innerResponse as $event) {
+                            $started = true;
+
+                            yield $event;
+                        }
+
+                        return;
+                    } catch (FailoverableException $e) {
+                        if ($started) {
+                            throw $e;
+                        }
+
+                        $lastException = $this->recordAgentFailover($provider, $model, $e);
+                    }
+                }
+
+                throw $lastException;
+            },
+            $meta,
         );
+
+        return $outer;
     }
 
     /**
      * Invoke the agent in a queued job.
      */
-    public function queue(string $prompt, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): QueuedAgentResponse
+    public function queue(Decisions|string $prompt, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): QueuedAgentResponse
     {
         if (static::isFaked()) {
             Ai::recordPrompt(
@@ -99,12 +179,32 @@ trait Promptable
     }
 
     /**
+     * Split a prompt input into its text and tool approval decisions.
+     *
+     * @return array{string, ?Decisions}
+     */
+    private function extractPromptInput(Decisions|string $prompt): array
+    {
+        if (is_string($prompt)) {
+            return [$prompt, null];
+        }
+
+        return ['', $prompt];
+    }
+
+    /**
      * Invoke the agent with a given prompt and broadcast the streamed events.
      */
-    public function broadcast(string $prompt, Channel|array $channels, array $attachments = [], bool $now = false, Lab|array|string|null $provider = null, ?string $model = null): StreamableAgentResponse
+    public function broadcast(Decisions|string $prompt, Channel|array $channels, array $attachments = [], bool $now = false, Lab|array|string|null $provider = null, ?string $model = null): StreamableAgentResponse
     {
+        $without = WithoutBroadcasting::eventsFor($this);
+
         return $this->stream($prompt, $attachments, $provider, $model)
-            ->each(function (StreamEvent $event) use ($channels, $now) {
+            ->each(function (StreamEvent $event) use ($channels, $now, $without): void {
+                if (WithoutBroadcasting::excludes($without, $event)) {
+                    return;
+                }
+
                 $event->{$now ? 'broadcastNow' : 'broadcast'}($channels);
             });
     }
@@ -112,7 +212,7 @@ trait Promptable
     /**
      * Invoke the agent with a given prompt and broadcast the streamed events immediately.
      */
-    public function broadcastNow(string $prompt, Channel|array $channels, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): StreamableAgentResponse
+    public function broadcastNow(Decisions|string $prompt, Channel|array $channels, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): StreamableAgentResponse
     {
         return $this->broadcast($prompt, $channels, $attachments, now: true, provider: $provider, model: $model);
     }
@@ -120,7 +220,7 @@ trait Promptable
     /**
      * Invoke the agent with a given prompt and broadcast the streamed events.
      */
-    public function broadcastOnQueue(string $prompt, Channel|array $channels, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): QueuedAgentResponse
+    public function broadcastOnQueue(Decisions|string $prompt, Channel|array $channels, array $attachments = [], Lab|array|string|null $provider = null, ?string $model = null): QueuedAgentResponse
     {
         if (static::isFaked()) {
             Ai::recordPrompt(
@@ -140,27 +240,64 @@ trait Promptable
      */
     private function withModelFailover(Closure $callback, Lab|array|string|null $provider, ?string $model): mixed
     {
-        $providers = $this->getProvidersAndModels($provider, $model);
-
         $lastException = null;
 
-        foreach ($providers as $provider => $model) {
-            $provider = Ai::textProviderFor($this, $provider);
-
-            $model ??= $this->getDefaultModelFor($provider);
-
+        foreach ($this->iterateProvidersWithFailover($this->getProvidersAndModelsForFailover($provider, $model)) as [$provider, $model]) {
             try {
                 return $callback($provider, $model);
             } catch (FailoverableException $e) {
-                $lastException = $e;
-
-                event(new AgentFailedOver($this, $provider, $model, $e));
-
-                continue;
+                $lastException = $this->recordAgentFailover($provider, $model, $e);
             }
         }
 
-        throw $lastException ?? new RuntimeException('No AI providers were configured.');
+        throw $lastException;
+    }
+
+    /**
+     * Get the configured providers and models for failover.
+     */
+    private function getProvidersAndModelsForFailover(Lab|array|string|null $provider, ?string $model): array
+    {
+        $providers = $this->getProvidersAndModels($provider, $model);
+
+        if (empty($providers)) {
+            throw new RuntimeException('No AI providers were configured.');
+        }
+
+        return $providers;
+    }
+
+    /**
+     * Get the single provider / model pair an approval continuation must run against, since it may not fail over to a different provider.
+     */
+    private function providersForApprovalContinuation(Lab|array|string|null $provider, ?string $model): array
+    {
+        return array_slice($this->getProvidersAndModelsForFailover($provider, $model), 0, 1, true);
+    }
+
+    /**
+     * Iterate the configured provider / model pairs.
+     *
+     * @param  array<string, string|null>  $providers
+     * @return Generator<int, array{TextProvider, string}>
+     */
+    private function iterateProvidersWithFailover(array $providers): Generator
+    {
+        foreach ($providers as $provider => $model) {
+            $provider = Ai::textProviderFor($this, $provider);
+
+            yield [$provider, $model ?? $this->getDefaultModelFor($provider)];
+        }
+    }
+
+    /**
+     * Record that an agent failed over to the next configured provider.
+     */
+    private function recordAgentFailover(Provider $provider, string $model, FailoverableException $exception): FailoverableException
+    {
+        event(new AgentFailedOver($this, $provider, $model, $exception));
+
+        return $exception;
     }
 
     /**
@@ -174,7 +311,7 @@ trait Promptable
             } else {
                 $attributes = (new ReflectionClass($this))->getAttributes(ProviderAttribute::class);
 
-                $provider = ! empty($attributes) ? $attributes[0]->newInstance()->value : null;
+                $provider = $attributes === [] ? null : $attributes[0]->newInstance()->value;
             }
         }
 
@@ -184,19 +321,23 @@ trait Promptable
             } else {
                 $attributes = (new ReflectionClass($this))->getAttributes(ModelAttribute::class);
 
-                $model = ! empty($attributes) ? $attributes[0]->newInstance()->value : null;
+                $model = $attributes === [] ? null : $attributes[0]->newInstance()->value;
             }
         }
 
-        return Provider::formatProviderAndModelList(
-            $provider ?? config('ai.default'), $model
-        );
+        $resolved = $provider ?? config('ai.default');
+
+        if (is_array($resolved) && array_intersect(array_keys($resolved), ['text', 'image', 'audio', 'transcription', 'embedding', 'reranking'])) {
+            throw new InvalidArgumentException('The "ai.default" config value must be a string provider name or a Lab enum, not an array.');
+        }
+
+        return Provider::formatProviderAndModelList($resolved, $model);
     }
 
     /**
      * Get the default model to use for the given provider.
      */
-    protected function getDefaultModelFor(Provider $provider): string
+    protected function getDefaultModelFor(TextProvider $provider): string
     {
         $reflection = new ReflectionClass($this);
 
@@ -226,7 +367,7 @@ trait Promptable
 
         $attributes = (new ReflectionClass($this))->getAttributes(TimeoutAttribute::class);
 
-        if (! empty($attributes)) {
+        if ($attributes !== []) {
             return $attributes[0]->newInstance()->value;
         }
 
